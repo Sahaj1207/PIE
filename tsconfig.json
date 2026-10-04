@@ -1,0 +1,9 @@
+{
+  "extends": "@react-native/typescript-config",
+  "compilerOptions": {
+    "strict": true,
+    "skipLibCheck": true
+  },
+  "include": ["src/**/*", "__tests__/**/*", "*.d.ts"],
+  "exclude": ["node_modules", "**/node_modules", "**/Pods"]
+}
