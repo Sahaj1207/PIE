@@ -45,6 +45,11 @@ export interface TextRegion {
   readonly reconstructedPatchUri?: string;
   /** Bounding box in document coordinates for the reconstructed patch (including any padding) */
   readonly reconstructedPatchBounds?: DocumentRect;
+  /**
+   * Set when a persisted document is reopened and the reconstructed patch file for this
+   * region can no longer be found. The edit status is preserved; the patch must be regenerated.
+   */
+  readonly patchUnavailable?: boolean;
 }
 
 export interface AddedTextElement {
@@ -54,10 +59,32 @@ export interface AddedTextElement {
   readonly pageIndex: number;
   /** Bounding box in document coordinates */
   readonly bounds: DocumentRect;
-  /** Text content */
+  /** Text content; explicit newlines are preserved as separate lines. */
   readonly text: string;
-  /** Text style */
+  /** Text style (font family, size, weight, style, color, alignment, line height). */
   readonly style: TextStyleSpec;
+  /**
+   * Optional wrap width in document pixels. When set, lines longer than this wrap at
+   * whitespace (deterministically, via the shared text layout). Unset = only explicit
+   * newlines break lines.
+   */
+  readonly wrapWidth?: number;
+}
+
+/**
+ * Markup drawn on an image page (pen, highlighter, shapes, signatures). Path commands are in
+ * document (image pixel) coordinates: ['M',x,y] ['L',x,y] ['Q',cx,cy,x,y] ['C',...] ['Z'].
+ * Drawn above all other layers by both the canvas and the exporter.
+ */
+export interface ImageDrawing {
+  readonly id: string;
+  readonly pageIndex: number;
+  readonly kind: 'ink' | 'highlighter' | 'shape' | 'signature';
+  readonly commands: readonly (readonly (string | number)[])[];
+  readonly color: string;
+  /** Stroke width in document pixels. */
+  readonly width: number;
+  readonly opacity: number;
 }
 
 export interface OriginalContentRef {
@@ -70,6 +97,16 @@ export interface OriginalContentRef {
   readonly height: number;
   /** Dots per inch / resolution */
   readonly dpi?: number;
+  /**
+   * Optional downsampled display proxy of the working image (same aspect ratio).
+   * Used only for on-screen rendering; editing, OCR and export use assetUri at full resolution.
+   */
+  readonly previewUri?: string;
+  /**
+   * EXIF orientation of the imported source file. The working copy at assetUri is always
+   * stored upright (orientation 1), so width/height above are already display-oriented.
+   */
+  readonly sourceOrientation?: number;
 }
 
 export interface DocumentPage {
@@ -87,6 +124,8 @@ export interface DocumentPage {
   readonly editableTextRegions: TextRegion[];
   /** New text elements added by user */
   readonly addedText: AddedTextElement[];
+  /** Markup drawings (optional; absent in documents saved before markup existed). */
+  readonly drawings?: ImageDrawing[];
 }
 
 export interface DocumentMetadata {

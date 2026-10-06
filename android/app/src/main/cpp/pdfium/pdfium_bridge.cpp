@@ -1,6 +1,13 @@
+// PIE PDFium bridge.
+//
+// Platform-neutral engine (namespace pie_engine, see pie_pdf_engine.h) used by Android (JNI
+// wrappers at the end of this file) and iOS (PieNative Objective-C++ module). All PDF logic
+// lives here once; only the JNI plumbing is Android-specific.
+#if defined(__ANDROID__)
 #include <jni.h>
 #include <android/log.h>
 #include <android/bitmap.h>
+#endif
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -17,10 +24,21 @@
 #include "fpdf_text.h"
 #include "fpdf_edit.h"
 #include "fpdf_save.h"
+#include "fpdf_transformpage.h"
+
+#include "pie_bridge_core.h"
+#include "pie_pdf_ops.h"
+#include "pie_pdf_engine.h"
 
 #define TAG "PdfiumBridge"
+#if defined(__ANDROID__)
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+#else
+#include <cstdio>
+#define LOGI(...) ((void)0)
+#define LOGE(...) ((void)fprintf(stderr, __VA_ARGS__), (void)fprintf(stderr, "\n"))
+#endif
 
 namespace {
 
@@ -75,100 +93,44 @@ void ensureLibraryInitialized() {
     }
 }
 
+// UTF-16 (PDFium FPDF_WCHAR) -> standard UTF-8. Delegates to pie_bridge_core.h.
 std::string utf16ToUtf8(const unsigned short* wstr, size_t length) {
-    std::string out;
-    for (size_t i = 0; i < length; ++i) {
-        unsigned int cp = wstr[i];
-        if (cp == 0) break;
-        if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < length) {
-            unsigned int low = wstr[i + 1];
-            if (low >= 0xDC00 && low <= 0xDFFF) {
-                cp = 0x10000 + (((cp - 0xD800) << 10) | (low - 0xDC00));
-                i++;
-            }
-        }
-        if (cp <= 0x7F) {
-            out.push_back(static_cast<char>(cp));
-        } else if (cp <= 0x7FF) {
-            out.push_back(static_cast<char>(0xC0 | ((cp >> 6) & 0x1F)));
-            out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-        } else if (cp <= 0xFFFF) {
-            out.push_back(static_cast<char>(0xE0 | ((cp >> 12) & 0x0F)));
-            out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
-            out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-        } else {
-            out.push_back(static_cast<char>(0xF0 | ((cp >> 18) & 0x07)));
-            out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
-            out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
-            out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-        }
-    }
-    return out;
+    return pie::utf16ToUtf8(reinterpret_cast<const uint16_t*>(wstr), length, true);
 }
 
-std::string escapeJsonString(const std::string& input) {
-    std::string out;
-    out.reserve(input.size() + 16);
-    for (char c : input) {
-        switch (c) {
-            case '"': out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\b': out += "\\b"; break;
-            case '\f': out += "\\f"; break;
-            case '\n': out += "\\n"; break;
-            case '\r': out += "\\r"; break;
-            case '\t': out += "\\t"; break;
-            default:
-                if (static_cast<unsigned char>(c) < 0x20) {
-                    char buf[8];
-                    snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(c));
-                    out += buf;
-                } else {
-                    out += c;
-                }
-                break;
-        }
-    }
-    return out;
-}
+using pie::escapeJsonString;
 
+// Standard UTF-8 -> NUL-terminated UTF-16 for PDFium FPDF_WIDESTRING arguments.
 std::vector<FPDF_WCHAR> utf8ToUtf16(const std::string& utf8) {
-    std::vector<FPDF_WCHAR> out;
-    size_t i = 0;
-    while (i < utf8.size()) {
-        uint32_t cp = 0;
-        unsigned char c = utf8[i];
-        if (c <= 0x7F) {
-            cp = c;
-            i += 1;
-        } else if ((c & 0xE0) == 0xC0) {
-            if (i + 1 >= utf8.size()) break;
-            cp = ((c & 0x1F) << 6) | (utf8[i + 1] & 0x3F);
-            i += 2;
-        } else if ((c & 0xF0) == 0xE0) {
-            if (i + 2 >= utf8.size()) break;
-            cp = ((c & 0x0F) << 12) | ((utf8[i + 1] & 0x3F) << 6) | (utf8[i + 2] & 0x3F);
-            i += 3;
-        } else if ((c & 0xF8) == 0xF0) {
-            if (i + 3 >= utf8.size()) break;
-            cp = ((c & 0x07) << 18) | ((utf8[i + 1] & 0x3F) << 12) | ((utf8[i + 2] & 0x3F) << 6) | (utf8[i + 3] & 0x3F);
-            i += 4;
-        } else {
-            i += 1;
-            continue;
-        }
-
-        if (cp <= 0xFFFF) {
-            out.push_back(static_cast<FPDF_WCHAR>(cp));
-        } else {
-            cp -= 0x10000;
-            out.push_back(static_cast<FPDF_WCHAR>(0xD800 + (cp >> 10)));
-            out.push_back(static_cast<FPDF_WCHAR>(0xDC00 + (cp & 0x3FF)));
-        }
-    }
+    const std::vector<uint16_t> units = pie::utf8ToUtf16(utf8);
+    std::vector<FPDF_WCHAR> out(units.begin(), units.end());
     out.push_back(0);
     return out;
 }
+
+#if defined(__ANDROID__)
+// JNI strings are converted through UTF-16 (GetStringChars / NewString). The JNI
+// GetStringUTFChars / NewStringUTF pair uses "modified UTF-8", which encodes non-BMP
+// characters (emoji, some CJK) as surrogate halves and makes NewStringUTF reject or garble
+// standard 4-byte UTF-8 -- that silently corrupted text and could abort under CheckJNI.
+std::string jstringToUtf8(JNIEnv* env, jstring value) {
+    if (!value) return std::string();
+    const jsize length = env->GetStringLength(value);
+    const jchar* chars = env->GetStringChars(value, nullptr);
+    if (!chars) return std::string();
+    std::string out = pie::utf16ToUtf8(reinterpret_cast<const uint16_t*>(chars), static_cast<size_t>(length), false);
+    env->ReleaseStringChars(value, chars);
+    return out;
+}
+
+jstring utf8ToJstring(JNIEnv* env, const std::string& utf8) {
+    const std::vector<uint16_t> units = pie::utf8ToUtf16(utf8);
+    static const jchar kEmpty = 0;
+    return env->NewString(units.empty() ? &kEmpty : reinterpret_cast<const jchar*>(units.data()),
+                          static_cast<jsize>(units.size()));
+}
+
+#endif
 
 bool isSubsetFont(const std::string& baseFontName) {
     if (baseFontName.length() < 8 || baseFontName[6] != '+') return false;
@@ -181,7 +143,9 @@ bool isSubsetFont(const std::string& baseFontName) {
 std::string resolveStandardFontNameCpp(const std::string& family, bool isBold, bool isItalic) {
     std::string fam = family;
     std::transform(fam.begin(), fam.end(), fam.begin(), ::tolower);
-    if (fam.find("times") != std::string::npos || fam.find("serif") != std::string::npos) {
+    // "sans-serif" contains "serif": it is Helvetica, never Times
+    const bool sans = fam.find("sans") != std::string::npos;
+    if (fam.find("times") != std::string::npos || (!sans && fam.find("serif") != std::string::npos)) {
         if (isBold && isItalic) return "Times-BoldItalic";
         if (isBold) return "Times-Bold";
         if (isItalic) return "Times-Italic";
@@ -199,32 +163,30 @@ std::string resolveStandardFontNameCpp(const std::string& family, bool isBold, b
     return "Helvetica";
 }
 
-struct EditCommand {
-    std::string type; // "replace", "delete", or "insert"
-    std::string objectId;
-    int pageIndex = 0;
-    int objectIndex = 0;
-    std::vector<int> objectPath;
-    std::string originalText;
-    std::string newText;
-    std::string text;
-    double x = 0.0;
-    double y = 0.0;
-    double fontSize = 14.0;
-    std::string fontName = "Helvetica";
-    std::string colorHex;
-    int colorR = 0;
-    int colorG = 0;
-    int colorB = 0;
-    int colorA = 255;
-    bool hasFontSize = false;
-    bool hasColor = false;
-    bool hasBold = false;
-    bool isBold = false;
-    bool hasItalic = false;
-    bool isItalic = false;
-    std::string fontFamily;
-};
+using pie::EditCommand;
+
+// Swaps a root-level page object for `replacement` at the same position in the page's object
+// list, so the new text keeps the original stacking order (it is not drawn over shapes or
+// images that covered the original). On failure the page is left unchanged and false is
+// returned; the caller still owns `replacement`. On success the caller owns `oldObj` (now
+// detached from the page) and must destroy it once nothing refers to it.
+bool replaceRootObjectInPlace(FPDF_PAGE page, FPDF_PAGEOBJECT oldObj, FPDF_PAGEOBJECT replacement) {
+    const int count = FPDFPage_CountObjects(page);
+    int index = -1;
+    for (int i = 0; i < count; ++i) {
+        if (FPDFPage_GetObject(page, i) == oldObj) {
+            index = i;
+            break;
+        }
+    }
+    if (index < 0 || !FPDFPage_RemoveObject(page, oldObj)) return false;
+    if (FPDFPage_InsertObjectAtIndex(page, replacement, static_cast<size_t>(index))) return true;
+    // Restore the original at its position (or at the end if that fails too)
+    if (!FPDFPage_InsertObjectAtIndex(page, oldObj, static_cast<size_t>(index))) {
+        FPDFPage_InsertObject(page, oldObj);
+    }
+    return false;
+}
 
 FS_MATRIX identityMatrix() {
     return FS_MATRIX{1, 0, 0, 1, 0, 0};
@@ -271,225 +233,8 @@ std::string objectPathId(int pageIndex, const std::vector<int>& path) {
     return ss.str();
 }
 
-std::vector<int> extractJsonIntArrayField(const std::string& objStr, const std::string& key) {
-    std::vector<int> values;
-    const std::string needle = "\"" + key + "\"";
-    size_t pos = objStr.find(needle);
-    if (pos == std::string::npos) return values;
-    pos = objStr.find('[', pos + needle.length());
-    if (pos == std::string::npos) return values;
-    const size_t close = objStr.find(']', pos + 1);
-    if (close == std::string::npos) return values;
-    while (++pos < close) {
-        while (pos < close && (objStr[pos] == ' ' || objStr[pos] == ',' || objStr[pos] == '\t')) ++pos;
-        size_t end = pos;
-        if (end < close && objStr[end] == '-') ++end;
-        while (end < close && isdigit(objStr[end])) ++end;
-        if (end > pos) {
-            try {
-                values.push_back(std::stoi(objStr.substr(pos, end - pos)));
-            } catch (...) {}
-        }
-        pos = end;
-    }
-    return values;
-}
-
-void parseHexColor(const std::string& hex, int& r, int& g, int& b, int& a) {
-    if (hex.empty()) return;
-    std::string clean = hex;
-    if (clean[0] == '#') clean = clean.substr(1);
-    if (clean.length() == 6) {
-        try {
-            r = std::stoi(clean.substr(0, 2), nullptr, 16);
-            g = std::stoi(clean.substr(2, 2), nullptr, 16);
-            b = std::stoi(clean.substr(4, 2), nullptr, 16);
-            a = 255;
-        } catch (...) {}
-    } else if (clean.length() == 8) {
-        try {
-            r = std::stoi(clean.substr(0, 2), nullptr, 16);
-            g = std::stoi(clean.substr(2, 2), nullptr, 16);
-            b = std::stoi(clean.substr(4, 2), nullptr, 16);
-            a = std::stoi(clean.substr(6, 2), nullptr, 16);
-        } catch (...) {}
-    }
-}
-
-std::string extractJsonStringField(const std::string& objStr, const std::string& key) {
-    std::string needle = "\"" + key + "\"";
-    size_t pos = objStr.find(needle);
-    if (pos == std::string::npos) return "";
-    pos = objStr.find(':', pos + needle.length());
-    if (pos == std::string::npos) return "";
-    pos = objStr.find('\"', pos);
-    if (pos == std::string::npos) return "";
-    size_t start = pos + 1;
-    std::string val;
-    for (size_t i = start; i < objStr.length(); ++i) {
-        if (objStr[i] == '\\' && i + 1 < objStr.length()) {
-            val += objStr[i + 1];
-            i++;
-        } else if (objStr[i] == '\"') {
-            break;
-        } else {
-            val += objStr[i];
-        }
-    }
-    return val;
-}
-
-int extractJsonIntField(const std::string& objStr, const std::string& key, int defaultVal = 0) {
-    std::string needle = "\"" + key + "\"";
-    size_t pos = objStr.find(needle);
-    if (pos == std::string::npos) return defaultVal;
-    pos = objStr.find(':', pos + needle.length());
-    if (pos == std::string::npos) return defaultVal;
-    while (pos < objStr.length() && (objStr[pos] == ' ' || objStr[pos] == '\t' || objStr[pos] == ':')) pos++;
-    size_t end = pos;
-    while (end < objStr.length() && (isdigit(objStr[end]) || objStr[end] == '-')) end++;
-    if (end > pos) {
-        try {
-            return std::stoi(objStr.substr(pos, end - pos));
-        } catch (...) {}
-    }
-    return defaultVal;
-}
-
-double extractJsonDoubleField(const std::string& objStr, const std::string& key, double defaultVal = 0.0) {
-    std::string needle = "\"" + key + "\"";
-    size_t pos = objStr.find(needle);
-    if (pos == std::string::npos) return defaultVal;
-    pos = objStr.find(':', pos + needle.length());
-    if (pos == std::string::npos) return defaultVal;
-    while (pos < objStr.length() && (objStr[pos] == ' ' || objStr[pos] == '\t' || objStr[pos] == ':')) pos++;
-    size_t end = pos;
-    while (end < objStr.length() && (isdigit(objStr[end]) || objStr[end] == '-' || objStr[end] == '.')) end++;
-    if (end > pos) {
-        try {
-            return std::stod(objStr.substr(pos, end - pos));
-        } catch (...) {}
-    }
-    return defaultVal;
-}
-
-std::vector<EditCommand> parseEditCommands(const std::string& json) {
-    std::vector<EditCommand> commands;
-    size_t i = 0;
-    while (i < json.length()) {
-        size_t openBrace = json.find('{', i);
-        if (openBrace == std::string::npos) break;
-        int depth = 0;
-        size_t closeBrace = std::string::npos;
-        bool inQuote = false;
-        for (size_t pos = openBrace; pos < json.length(); ++pos) {
-            char c = json[pos];
-            if (c == '\\' && inQuote && pos + 1 < json.length()) {
-                pos++;
-                continue;
-            }
-            if (c == '\"') {
-                inQuote = !inQuote;
-            } else if (!inQuote) {
-                if (c == '{') depth++;
-                else if (c == '}') {
-                    depth--;
-                    if (depth == 0) {
-                        closeBrace = pos;
-                        break;
-                    }
-                }
-            }
-        }
-        if (closeBrace == std::string::npos) break;
-        std::string objStr = json.substr(openBrace, closeBrace - openBrace + 1);
-
-        EditCommand cmd;
-        cmd.type = extractJsonStringField(objStr, "type");
-        cmd.objectId = extractJsonStringField(objStr, "objectId");
-        cmd.pageIndex = extractJsonIntField(objStr, "pageIndex", 0);
-        cmd.objectIndex = extractJsonIntField(objStr, "objectIndex", 0);
-        cmd.objectPath = extractJsonIntArrayField(objStr, "objectPath");
-        cmd.originalText = extractJsonStringField(objStr, "originalText");
-        cmd.newText = extractJsonStringField(objStr, "newText");
-        cmd.text = extractJsonStringField(objStr, "text");
-        cmd.x = extractJsonDoubleField(objStr, "x", 0.0);
-        cmd.y = extractJsonDoubleField(objStr, "y", 0.0);
-        cmd.fontSize = extractJsonDoubleField(objStr, "fontSize", 14.0);
-        cmd.fontName = extractJsonStringField(objStr, "fontName");
-        cmd.colorHex = extractJsonStringField(objStr, "color");
-        cmd.colorR = extractJsonIntField(objStr, "colorR", 0);
-        cmd.colorG = extractJsonIntField(objStr, "colorG", 0);
-        cmd.colorB = extractJsonIntField(objStr, "colorB", 0);
-        cmd.colorA = extractJsonIntField(objStr, "colorA", 255);
-
-        if (cmd.colorR == 0 && cmd.colorG == 0 && cmd.colorB == 0 && !cmd.colorHex.empty()) {
-            parseHexColor(cmd.colorHex, cmd.colorR, cmd.colorG, cmd.colorB, cmd.colorA);
-            cmd.hasColor = true;
-        }
-
-        // Check for nested "format" object
-        size_t formatPos = objStr.find("\"format\"");
-        if (formatPos != std::string::npos) {
-            size_t fOpen = objStr.find('{', formatPos);
-            if (fOpen != std::string::npos) {
-                int fDepth = 0;
-                size_t fClose = std::string::npos;
-                bool fInQuote = false;
-                for (size_t p = fOpen; p < objStr.length(); ++p) {
-                    char c = objStr[p];
-                    if (c == '\\' && fInQuote && p + 1 < objStr.length()) { p++; continue; }
-                    if (c == '\"') fInQuote = !fInQuote;
-                    else if (!fInQuote) {
-                        if (c == '{') fDepth++;
-                        else if (c == '}') {
-                            fDepth--;
-                            if (fDepth == 0) { fClose = p; break; }
-                        }
-                    }
-                }
-                if (fClose != std::string::npos) {
-                    std::string formatStr = objStr.substr(fOpen, fClose - fOpen + 1);
-                    double fSize = extractJsonDoubleField(formatStr, "fontSize", 0.0);
-                    if (fSize > 0) {
-                        cmd.hasFontSize = true;
-                        cmd.fontSize = fSize;
-                    }
-                    std::string fColor = extractJsonStringField(formatStr, "color");
-                    if (!fColor.empty()) {
-                        cmd.hasColor = true;
-                        cmd.colorHex = fColor;
-                        parseHexColor(fColor, cmd.colorR, cmd.colorG, cmd.colorB, cmd.colorA);
-                    }
-                    if (formatStr.find("\"isBold\":true") != std::string::npos) {
-                        cmd.hasBold = true;
-                        cmd.isBold = true;
-                    } else if (formatStr.find("\"isBold\":false") != std::string::npos) {
-                        cmd.hasBold = true;
-                        cmd.isBold = false;
-                    }
-                    if (formatStr.find("\"isItalic\":true") != std::string::npos) {
-                        cmd.hasItalic = true;
-                        cmd.isItalic = true;
-                    } else if (formatStr.find("\"isItalic\":false") != std::string::npos) {
-                        cmd.hasItalic = true;
-                        cmd.isItalic = false;
-                    }
-                    std::string fFamily = extractJsonStringField(formatStr, "fontFamily");
-                    if (!fFamily.empty()) {
-                        cmd.fontFamily = fFamily;
-                    }
-                }
-            }
-        }
-
-        if (!cmd.type.empty()) {
-            commands.push_back(cmd);
-        }
-        i = closeBrace + 1;
-    }
-    return commands;
-}
+// Edit batches are parsed by pie::parseEditCommands (strict JSON including all string escapes and
+// UTF-16 surrogate-pair escapes), see pie_bridge_core.h.
 
 std::string extractTextObjectText(
     FPDF_PAGEOBJECT object,
@@ -550,12 +295,67 @@ std::string extractTextObjectText(
     return "";
 }
 
+// Page user space -> display space (points, top-left origin, Y down) exactly as PDFium renders
+// the page (FPDF_RenderPageBitmap with rotate 0 applies the page's /Rotate and crop box).
+// Derived from FPDF_PageToDevice at a fine device resolution so rotation and box offsets come
+// from PDFium itself rather than hand-written math. u = a*x + c*y + e, v = b*x + d*y + f.
+// Display-matrix helpers are shared with the platform-neutral document operations.
+using pie_pdf::displayMatrixFallback;
+using pie_pdf::computeDisplayMatrix;
+using pie_pdf::pageDisplayMatrix;
+
+// Text object matrix (rotation part) that makes text read upright, left-to-right in the
+// DISPLAYED page: baseline along display +u, glyph "up" along display -v.
+void uprightTextBasis(const FS_MATRIX& display, float& ta, float& tb, float& tc, float& td) {
+    const double det = static_cast<double>(display.a) * display.d - static_cast<double>(display.b) * display.c;
+    if (std::abs(det) < 1e-9) {
+        ta = 1; tb = 0; tc = 0; td = 1;
+        return;
+    }
+    // inverse of [[a c],[b d]] = (1/det) [[d -c],[-b a]]
+    ta = static_cast<float>(display.d / det);   // inv * (1, 0)
+    tb = static_cast<float>(-display.b / det);
+    tc = static_cast<float>(display.c / det);   // inv * (0, -1)
+    td = static_cast<float>(-display.a / det);
+}
+
+// Code points of `newText` the font cannot draw with its own glyphs. Characters already
+// present in `existingText` (currently rendered by this object) are trusted; spaces are
+// skipped; supplementary-plane characters (emoji etc.) and control characters never pass.
+std::vector<uint32_t> findMissingGlyphs(FPDF_FONT font, const std::string& newText, const std::string& existingText) {
+    std::vector<uint32_t> missing;
+    const std::vector<uint32_t> existing = pie::decodeCodePoints(existingText);
+    for (uint32_t cp : pie::decodeCodePoints(newText)) {
+        bool known = false;
+        for (uint32_t m : missing) if (m == cp) { known = true; break; }
+        if (known) continue;
+        if (cp == 0x20 || cp == 0xA0) continue;
+        if (cp > 0xFFFF || cp < 0x20 || cp == 0xFFFD) {
+            missing.push_back(cp);
+            continue;
+        }
+        bool present = false;
+        for (uint32_t e : existing) if (e == cp) { present = true; break; }
+        if (present) continue;
+        FPDF_GLYPHPATH glyph = font ? FPDFFont_GetGlyphPath(font, cp, 12.0f) : nullptr;
+        if (!glyph || FPDFGlyphPath_CountGlyphSegments(glyph) <= 0) {
+            missing.push_back(cp);
+        }
+    }
+    return missing;
+}
+
+std::string unsupportedGlyphsMessage(const std::vector<uint32_t>& missing, const std::string& what) {
+    return std::string(pie::kUnsupportedGlyphsPrefix) + what + " cannot display " +
+           pie::describeCodePoints(missing) + ". The text was not changed.";
+}
+
 void appendTextObjectJson(
     std::ostringstream& ss,
     bool& first,
     FPDF_PAGEOBJECT object,
     int pageIndex,
-    double pageHeight,
+    const FS_MATRIX& displayMatrix,
     FPDF_TEXTPAGE textPage,
     const std::vector<int>& path,
     const FS_MATRIX& parentMatrix) {
@@ -617,8 +417,11 @@ void appendTextObjectJson(
     }
     ss << "],";
     ss << "\"text\":\"" << escapeJsonString(textUtf8) << "\",";
-    ss << "\"bounds\":{\"x\":" << pageLeft << ",\"y\":" << (pageHeight - pageTop)
-       << ",\"width\":" << std::abs(pageRight - pageLeft) << ",\"height\":" << std::abs(pageTop - pageBottom) << "},";
+    // Display-space bounds (what is rendered): rotation and crop-box origin applied.
+    float dispLeft = 0, dispTop = 0, dispRight = 0, dispBottom = 0;
+    transformBounds(displayMatrix, pageLeft, pageBottom, pageRight, pageTop, dispLeft, dispTop, dispRight, dispBottom);
+    ss << "\"bounds\":{\"x\":" << dispLeft << ",\"y\":" << dispTop
+       << ",\"width\":" << std::abs(dispRight - dispLeft) << ",\"height\":" << std::abs(dispBottom - dispTop) << "},";
     ss << "\"pdfBounds\":{\"left\":" << pageLeft << ",\"bottom\":" << pageBottom
        << ",\"right\":" << pageRight << ",\"top\":" << pageTop << "},";
     ss << "\"fontSize\":" << ((hasFontSize && fontSize > 0) ? std::to_string(fontSize) : "null") << ",";
@@ -651,7 +454,7 @@ void appendTextObjectJson(
 void traverseTextObjects(
     FPDF_PAGEOBJECT object,
     int pageIndex,
-    double pageHeight,
+    const FS_MATRIX& displayMatrix,
     FPDF_TEXTPAGE textPage,
     const std::vector<int>& path,
     const FS_MATRIX& parentMatrix,
@@ -660,7 +463,7 @@ void traverseTextObjects(
     if (!object) return;
     const int type = FPDFPageObj_GetType(object);
     if (type == FPDF_PAGEOBJ_TEXT) {
-        appendTextObjectJson(ss, first, object, pageIndex, pageHeight, textPage, path, parentMatrix);
+        appendTextObjectJson(ss, first, object, pageIndex, displayMatrix, textPage, path, parentMatrix);
         return;
     }
     if (type != FPDF_PAGEOBJ_FORM) return;
@@ -676,7 +479,7 @@ void traverseTextObjects(
         traverseTextObjects(
             FPDFFormObj_GetObject(object, i),
             pageIndex,
-            pageHeight,
+            displayMatrix,
             textPage,
             childPath,
             childParentMatrix,
@@ -731,6 +534,182 @@ void collectTextObjectStrings(FPDF_PAGEOBJECT object, FPDF_TEXTPAGE textPage,
     }
 }
 
+// Text of the text object at `path` (root index, then Form XObject child indices), extracted
+// exactly as collectTextObjectStrings extracts the same object. Returns false when the path
+// does not resolve to a text object.
+bool extractTextAtPath(FPDF_PAGE page, FPDF_TEXTPAGE textPage, const std::vector<int>& path,
+                       std::string& outText) {
+    if (!page || path.empty() || path[0] < 0 || path[0] >= FPDFPage_CountObjects(page)) return false;
+    FPDF_PAGEOBJECT current = FPDFPage_GetObject(page, path[0]);
+    FS_MATRIX parentMatrix = identityMatrix();
+    for (size_t i = 1; i < path.size(); ++i) {
+        if (!current || FPDFPageObj_GetType(current) != FPDF_PAGEOBJ_FORM) return false;
+        FS_MATRIX formMatrix = identityMatrix();
+        if (FPDFPageObj_GetMatrix(current, &formMatrix)) {
+            parentMatrix = composeMatrix(parentMatrix, formMatrix);
+        }
+        if (path[i] < 0 || path[i] >= FPDFFormObj_CountObjects(current)) return false;
+        current = FPDFFormObj_GetObject(current, path[i]);
+    }
+    if (!current || FPDFPageObj_GetType(current) != FPDF_PAGEOBJ_TEXT) return false;
+    float left = 0, bottom = 0, right = 0, top = 0;
+    float pageLeft = 0, pageBottom = 0, pageRight = 0, pageTop = 0;
+    if (FPDFPageObj_GetBounds(current, &left, &bottom, &right, &top)) {
+        transformBounds(parentMatrix, left, bottom, right, top, pageLeft, pageBottom, pageRight, pageTop);
+    }
+    outText = extractTextObjectText(current, textPage, pageLeft, pageBottom, pageRight, pageTop);
+    return true;
+}
+
+bool findObjectInTree(FPDF_PAGEOBJECT node, FPDF_PAGEOBJECT target, std::vector<int>& path) {
+    if (!node) return false;
+    if (node == target) return true;
+    if (FPDFPageObj_GetType(node) != FPDF_PAGEOBJ_FORM) return false;
+    const int childCount = FPDFFormObj_CountObjects(node);
+    for (int i = 0; i < childCount; ++i) {
+        path.push_back(i);
+        if (findObjectInTree(FPDFFormObj_GetObject(node, i), target, path)) return true;
+        path.pop_back();
+    }
+    return false;
+}
+
+// Object path (root index, then Form XObject child indices) of `target` on `page`.
+// Moves the contents of the root-level Form XObject `form` onto the page, in place (same order,
+// same stacking position), applying the form's matrix to every moved object and its clip path,
+// then removes the empty form. Appearance is unchanged; afterwards the content is ordinary page
+// content, which FPDFPage_GenerateContent writes on save. (Changes to objects INSIDE a form are
+// not written by FPDFPage_GenerateContent, and PDFium has no public API to regenerate a form's
+// stream, so editing text inside a form requires this.) The moved objects keep their identity,
+// so pointers resolved before flattening stay valid. Returns false (page unchanged) when the
+// form holds content PDFium cannot re-serialise as page content (e.g. shadings).
+bool flattenRootForm(FPDF_PAGE page, FPDF_PAGEOBJECT form, std::string& error) {
+    const int rootCount = FPDFPage_CountObjects(page);
+    int index = -1;
+    for (int i = 0; i < rootCount; ++i) {
+        if (FPDFPage_GetObject(page, i) == form) {
+            index = i;
+            break;
+        }
+    }
+    if (index < 0 || FPDFPageObj_GetType(form) != FPDF_PAGEOBJ_FORM) {
+        error = "Content block not found on the page";
+        return false;
+    }
+    const int childCount = FPDFFormObj_CountObjects(form);
+    if (childCount < 0) {
+        error = "Content block could not be read";
+        return false;
+    }
+    for (int i = 0; i < childCount; ++i) {
+        const int type = FPDFPageObj_GetType(FPDFFormObj_GetObject(form, static_cast<unsigned long>(i)));
+        if (type != FPDF_PAGEOBJ_TEXT && type != FPDF_PAGEOBJ_PATH && type != FPDF_PAGEOBJ_IMAGE &&
+            type != FPDF_PAGEOBJ_FORM) {
+            error = "This text is part of a content block with graphics PIE cannot rewrite safely";
+            return false;
+        }
+    }
+    FS_MATRIX m{1, 0, 0, 1, 0, 0};
+    if (!FPDFPageObj_GetMatrix(form, &m)) {
+        error = "Content block position could not be read";
+        return false;
+    }
+    for (int i = 0; i < childCount; ++i) {
+        FPDF_PAGEOBJECT child = FPDFFormObj_GetObject(form, 0);
+        if (!child || !FPDFFormObj_RemoveObject(form, child)) {
+            error = "Content block could not be converted";
+            return false;
+        }
+        FPDFPageObj_TransformF(child, &m);
+        if (FPDFPageObj_GetClipPath(child)) {
+            FPDFPageObj_TransformClipPath(child, m.a, m.b, m.c, m.d, m.e, m.f);
+        }
+        if (!FPDFPage_InsertObjectAtIndex(page, child, static_cast<size_t>(index + i))) {
+            FPDFPage_InsertObject(page, child);
+        }
+    }
+    if (FPDFPage_RemoveObject(page, form)) {
+        FPDFPageObj_Destroy(form);
+    }
+    return true;
+}
+
+// ---- Line reflow (word-processor-like edits inside a line) ---------------------------------
+// Geometry is in page (user) space. Only root-level, upright text objects take part; anything
+// else (rotated text, objects still inside forms) is never moved.
+
+struct PieBox {
+    float l = 0, b = 0, r = 0, t = 0;
+    float baseline = 0;  // page-space y of the text origin
+    float size = 0;      // effective font size (Tf size x vertical matrix scale)
+    float h() const { return t - b; }
+};
+
+bool pieUprightTextBox(FPDF_PAGEOBJECT o, PieBox& box) {
+    if (!o || FPDFPageObj_GetType(o) != FPDF_PAGEOBJ_TEXT) return false;
+    FS_MATRIX m;
+    if (!FPDFPageObj_GetMatrix(o, &m) || std::fabs(m.b) > 1e-3f || std::fabs(m.c) > 1e-3f || m.a <= 0 || m.d <= 0) {
+        return false;
+    }
+    float fontSize = 0;
+    if (!FPDFTextObj_GetFontSize(o, &fontSize) || fontSize <= 0) fontSize = 1;
+    box.baseline = m.f;
+    box.size = fontSize * m.d;
+    return FPDFPageObj_GetBounds(o, &box.l, &box.b, &box.r, &box.t) && box.r >= box.l && box.t > box.b;
+}
+
+// Same typeset line: baselines within a third of the font size and comparable sizes. (Ink boxes
+// alone are unreliable: commas, descenders and small letters barely overlap capitals.)
+bool pieSameLine(const PieBox& a, const PieBox& c) {
+    const float big = std::max(a.size, c.size), small = std::min(a.size, c.size);
+    if (small <= 0) return false;
+    return std::fabs(a.baseline - c.baseline) <= big * 0.35f && big <= small * 2.0f;
+}
+
+// Root-level text objects on `line` that start at or after `fromX`, in reading order, up to
+// the first gap wider than the line height (a column break): the run that follows an edit.
+std::vector<std::pair<FPDF_PAGEOBJECT, PieBox>> pieFollowingRun(FPDF_PAGE page, const PieBox& line, float fromX,
+                                                                const std::vector<FPDF_PAGEOBJECT>& exclude) {
+    std::vector<std::pair<FPDF_PAGEOBJECT, PieBox>> candidates;
+    const int count = FPDFPage_CountObjects(page);
+    for (int i = 0; i < count; ++i) {
+        FPDF_PAGEOBJECT o = FPDFPage_GetObject(page, i);
+        if (std::find(exclude.begin(), exclude.end(), o) != exclude.end()) continue;
+        PieBox box;
+        if (!pieUprightTextBox(o, box) || !pieSameLine(line, box)) continue;
+        if (box.l < fromX - 0.5f) continue;
+        candidates.emplace_back(o, box);
+    }
+    std::sort(candidates.begin(), candidates.end(),
+              [](const auto& x, const auto& y) { return x.second.l < y.second.l; });
+    std::vector<std::pair<FPDF_PAGEOBJECT, PieBox>> run;
+    const float maxGap = std::max(1.0f, line.size);
+    float prevRight = fromX;
+    for (const auto& c : candidates) {
+        if (c.second.l - prevRight > maxGap) break;
+        run.push_back(c);
+        prevRight = std::max(prevRight, c.second.r);
+    }
+    return run;
+}
+
+void pieShiftRun(const std::vector<std::pair<FPDF_PAGEOBJECT, PieBox>>& run, float dx) {
+    if (std::fabs(dx) < 0.01f) return;
+    for (const auto& c : run) FPDFPageObj_Transform(c.first, 1, 0, 0, 1, dx, 0);
+}
+
+bool locateObjectPath(FPDF_PAGE page, FPDF_PAGEOBJECT target, std::vector<int>& outPath) {
+    outPath.clear();
+    if (!page || !target) return false;
+    const int rootCount = FPDFPage_CountObjects(page);
+    for (int i = 0; i < rootCount; ++i) {
+        outPath.assign(1, i);
+        if (findObjectInTree(FPDFPage_GetObject(page, i), target, outPath)) return true;
+    }
+    outPath.clear();
+    return false;
+}
+
 FPDF_DOCUMENT getDoc(int64_t handle) {
     auto it = g_documents.find(handle);
     if (it == g_documents.end()) {
@@ -741,16 +720,14 @@ FPDF_DOCUMENT getDoc(int64_t handle) {
 
 } // namespace
 
-extern "C" {
+namespace pie_engine {
 
-JNIEXPORT void JNICALL
-Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeInit(JNIEnv* /* env */, jclass /* clazz */) {
+void initLibrary() {
     std::lock_guard<std::mutex> lock(g_mutex);
     ensureLibraryInitialized();
 }
 
-JNIEXPORT void JNICALL
-Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeDestroy(JNIEnv* /* env */, jclass /* clazz */) {
+void destroyLibrary() {
     std::lock_guard<std::mutex> lock(g_mutex);
     for (auto& pair : g_documents) {
         if (pair.second) {
@@ -765,42 +742,29 @@ Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeDestroy(JNIEnv* /* env */, 
     }
 }
 
-JNIEXPORT jlong JNICALL
-Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeOpenDocument(
-    JNIEnv* env, jclass /* clazz */, jstring jFilePath, jstring jPassword) {
+// Error of the calling thread's last openDocument(), captured while the engine lock is held:
+// PDFium's FPDF_GetLastError() is process-wide, so reading it later (after another thread used
+// PDFium) could report the wrong reason, e.g. a password PDF shown as "corrupt".
+thread_local unsigned long t_lastOpenError = 0;
+
+int64_t openDocument(const std::string& filePath, const char* password) {
     std::lock_guard<std::mutex> lock(g_mutex);
     ensureLibraryInitialized();
-
-    if (!jFilePath) {
-        LOGE("nativeOpenDocument: File path is null");
-        return 0;
-    }
-
-    const char* filePath = env->GetStringUTFChars(jFilePath, nullptr);
-    const char* password = jPassword ? env->GetStringUTFChars(jPassword, nullptr) : nullptr;
-
-    FPDF_DOCUMENT doc = FPDF_LoadDocument(filePath, password);
-
-    env->ReleaseStringUTFChars(jFilePath, filePath);
-    if (password) {
-        env->ReleaseStringUTFChars(jPassword, password);
-    }
-
+    FPDF_DOCUMENT doc = FPDF_LoadDocument(filePath.c_str(), password);
     if (!doc) {
         unsigned long err = FPDF_GetLastError();
+        t_lastOpenError = err;
         LOGE("Failed to open PDF document, FPDF_GetLastError: %lu", err);
         return 0;
     }
-
+    t_lastOpenError = 0;
     int64_t handle = g_nextDocHandle++;
     g_documents[handle] = doc;
     LOGI("Opened PDF document with handle %lld", (long long)handle);
     return handle;
 }
 
-JNIEXPORT void JNICALL
-Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeCloseDocument(
-    JNIEnv* /* env */, jclass /* clazz */, jlong docHandle) {
+void closeDocument(int64_t docHandle) {
     std::lock_guard<std::mutex> lock(g_mutex);
     auto it = g_documents.find(docHandle);
     if (it != g_documents.end()) {
@@ -812,121 +776,122 @@ Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeCloseDocument(
     }
 }
 
-JNIEXPORT jint JNICALL
-Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeGetPageCount(
-    JNIEnv* /* env */, jclass /* clazz */, jlong docHandle) {
+int getPageCount(int64_t docHandle) {
     std::lock_guard<std::mutex> lock(g_mutex);
     FPDF_DOCUMENT doc = getDoc(docHandle);
     if (!doc) {
-        LOGE("nativeGetPageCount: Invalid document handle %lld", (long long)docHandle);
+        LOGE("getPageCount: Invalid document handle %lld", (long long)docHandle);
         return -1;
     }
     return FPDF_GetPageCount(doc);
 }
 
-JNIEXPORT jdoubleArray JNICALL
-Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeGetPageSize(
-    JNIEnv* env, jclass /* clazz */, jlong docHandle, jint pageIndex) {
+bool getPageSize(int64_t docHandle, int pageIndex, double& width, double& height) {
     std::lock_guard<std::mutex> lock(g_mutex);
     FPDF_DOCUMENT doc = getDoc(docHandle);
-    if (!doc) {
-        LOGE("nativeGetPageSize: Invalid document handle %lld", (long long)docHandle);
-        return nullptr;
-    }
-
-    double width = 0.0;
-    double height = 0.0;
-    int res = FPDF_GetPageSizeByIndex(doc, pageIndex, &width, &height);
-    if (!res) {
-        LOGE("nativeGetPageSize: Failed to get page size for index %d", pageIndex);
-        return nullptr;
-    }
-
-    jdoubleArray result = env->NewDoubleArray(2);
-    jdouble dims[2] = { width, height };
-    env->SetDoubleArrayRegion(result, 0, 2, dims);
-    return result;
+    if (!doc) return false;
+    return FPDF_GetPageSizeByIndex(doc, pageIndex, &width, &height) != 0;
 }
 
-JNIEXPORT jboolean JNICALL
-Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeRenderPageToBitmap(
-    JNIEnv* env, jclass /* clazz */, jlong docHandle, jint pageIndex, jobject jBitmap) {
+// Page geometry: [displayWidth, displayHeight, rotationQuarterTurns, a, b, c, d, e, f] where
+// (a..f) maps PDF user space to the displayed page (points, top-left origin, Y down) exactly
+// as rendering does.
+bool getPageGeometry(int64_t docHandle, int pageIndex, double out[9]) {
     std::lock_guard<std::mutex> lock(g_mutex);
     FPDF_DOCUMENT doc = getDoc(docHandle);
-    if (!doc) {
-        LOGE("nativeRenderPageToBitmap: Invalid document handle %lld", (long long)docHandle);
-        return JNI_FALSE;
+    if (!doc) return false;
+    double width = 0.0, height = 0.0;
+    if (!FPDF_GetPageSizeByIndex(doc, pageIndex, &width, &height)) return false;
+    FPDF_PAGE page = FPDF_LoadPage(doc, pageIndex);
+    if (!page) return false;
+    FS_MATRIX m;
+    if (!computeDisplayMatrix(page, width, height, m)) {
+        m = displayMatrixFallback(height);
     }
+    int rotation = FPDFPage_GetRotation(page);
+    if (rotation < 0 || rotation > 3) rotation = 0;
+    FPDF_ClosePage(page);
+    const double values[9] = {width, height, static_cast<double>(rotation), m.a, m.b, m.c, m.d, m.e, m.f};
+    for (int i = 0; i < 9; ++i) out[i] = values[i];
+    return true;
+}
 
-    if (!jBitmap) {
-        LOGE("nativeRenderPageToBitmap: Destination bitmap is null");
-        return JNI_FALSE;
+// Renders the whole page into a caller-owned 32-bit buffer (white background, annotations).
+// rgbaOrder = true writes R,G,B,A bytes (Android ARGB_8888); false writes B,G,R,A (iOS BGRA).
+bool renderPageToBuffer(int64_t docHandle, int pageIndex, void* pixels, int width, int height, int stride, bool rgbaOrder) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    FPDF_DOCUMENT doc = getDoc(docHandle);
+    if (!doc || !pixels || width <= 0 || height <= 0) {
+        LOGE("renderPageToBuffer: invalid arguments");
+        return false;
     }
-
-    AndroidBitmapInfo info;
-    if (AndroidBitmap_getInfo(env, jBitmap, &info) < 0) {
-        LOGE("nativeRenderPageToBitmap: AndroidBitmap_getInfo failed");
-        return JNI_FALSE;
-    }
-
-    void* pixels = nullptr;
-    if (AndroidBitmap_lockPixels(env, jBitmap, &pixels) < 0 || !pixels) {
-        LOGE("nativeRenderPageToBitmap: AndroidBitmap_lockPixels failed");
-        return JNI_FALSE;
-    }
-
     FPDF_PAGE page = FPDF_LoadPage(doc, pageIndex);
     if (!page) {
-        LOGE("nativeRenderPageToBitmap: Failed to load page %d", pageIndex);
-        AndroidBitmap_unlockPixels(env, jBitmap);
-        return JNI_FALSE;
+        LOGE("renderPageToBuffer: Failed to load page %d", pageIndex);
+        return false;
     }
-
-    // PDFium bitmap wrapping the Android Bitmap's pixel memory
-    FPDF_BITMAP fpdfBitmap = FPDFBitmap_CreateEx(
-        info.width, info.height, FPDFBitmap_BGRA, pixels, info.stride);
-
+    FPDF_BITMAP fpdfBitmap = FPDFBitmap_CreateEx(width, height, FPDFBitmap_BGRA, pixels, stride);
     if (!fpdfBitmap) {
-        LOGE("nativeRenderPageToBitmap: FPDFBitmap_CreateEx failed");
         FPDF_ClosePage(page);
-        AndroidBitmap_unlockPixels(env, jBitmap);
-        return JNI_FALSE;
+        return false;
     }
-
-    // Fill background with opaque white
-    FPDFBitmap_FillRect(fpdfBitmap, 0, 0, info.width, info.height, 0xFFFFFFFF);
-
-    // Render page with annotations and reverse byte order for Android ARGB_8888
-    FPDF_RenderPageBitmap(
-        fpdfBitmap, page, 0, 0, info.width, info.height, 0,
-        FPDF_ANNOT | FPDF_REVERSE_BYTE_ORDER);
-
+    FPDFBitmap_FillRect(fpdfBitmap, 0, 0, width, height, 0xFFFFFFFF);
+    FPDF_RenderPageBitmap(fpdfBitmap, page, 0, 0, width, height, 0,
+                          FPDF_ANNOT | (rgbaOrder ? FPDF_REVERSE_BYTE_ORDER : 0));
     FPDFBitmap_Destroy(fpdfBitmap);
     FPDF_ClosePage(page);
-    AndroidBitmap_unlockPixels(env, jBitmap);
-
-    return JNI_TRUE;
+    return true;
 }
 
-JNIEXPORT jstring JNICALL
-Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeGetTextObjectsJson(
-    JNIEnv* env, jclass /* clazz */, jlong docHandle, jint pageIndex) {
+// Renders the display-space region starting at (left, top) points at `scale` pixels per point,
+// using the same page display transform as renderPageToBuffer.
+bool renderRegionToBuffer(int64_t docHandle, int pageIndex, void* pixels, int width, int height, int stride,
+                          double scale, double left, double top, bool rgbaOrder) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    FPDF_DOCUMENT doc = getDoc(docHandle);
+    if (!doc || !pixels || !(scale > 0.0) || width <= 0 || height <= 0) return false;
+    FPDF_PAGE page = FPDF_LoadPage(doc, pageIndex);
+    if (!page) return false;
+    FPDF_BITMAP fpdfBitmap = FPDFBitmap_CreateEx(width, height, FPDFBitmap_BGRA, pixels, stride);
+    if (!fpdfBitmap) {
+        FPDF_ClosePage(page);
+        return false;
+    }
+    FPDFBitmap_FillRect(fpdfBitmap, 0, 0, width, height, 0xFFFFFFFF);
+    // Applied after the page's own display matrix: display points -> region pixels.
+    const FS_MATRIX matrix{
+        static_cast<float>(scale), 0, 0, static_cast<float>(scale),
+        static_cast<float>(-left * scale), static_cast<float>(-top * scale)};
+    const FS_RECTF clip{0, 0, static_cast<float>(width), static_cast<float>(height)};
+    FPDF_RenderPageBitmapWithMatrix(fpdfBitmap, page, &matrix, &clip,
+                                    FPDF_ANNOT | (rgbaOrder ? FPDF_REVERSE_BYTE_ORDER : 0));
+    FPDFBitmap_Destroy(fpdfBitmap);
+    FPDF_ClosePage(page);
+    return true;
+}
+
+std::string getTextObjectsJson(int64_t docHandle, int pageIndex) {
     std::lock_guard<std::mutex> lock(g_mutex);
     FPDF_DOCUMENT doc = getDoc(docHandle);
     if (!doc) {
         LOGE("nativeGetTextObjectsJson: Invalid document handle %lld", (long long)docHandle);
-        return env->NewStringUTF("[]");
+        return std::string("[]");
     }
 
     FPDF_PAGE page = FPDF_LoadPage(doc, pageIndex);
     if (!page) {
         LOGE("nativeGetTextObjectsJson: Failed to load page %d", pageIndex);
-        return env->NewStringUTF("[]");
+        return std::string("[]");
     }
 
     double pageW = 0.0;
     double pageH = 0.0;
     FPDF_GetPageSizeByIndex(doc, pageIndex, &pageW, &pageH);
+
+    FS_MATRIX displayMatrix;
+    if (!computeDisplayMatrix(page, pageW, pageH, displayMatrix)) {
+        displayMatrix = displayMatrixFallback(pageH);
+    }
 
     FPDF_TEXTPAGE textPage = FPDFText_LoadPage(page);
     std::ostringstream recursiveJson;
@@ -937,7 +902,7 @@ Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeGetTextObjectsJson(
         traverseTextObjects(
             FPDFPage_GetObject(page, i),
             pageIndex,
-            pageH,
+            displayMatrix,
             textPage,
             std::vector<int>{i},
             identityMatrix(),
@@ -947,7 +912,7 @@ Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeGetTextObjectsJson(
     recursiveJson << "]";
     if (textPage) FPDFText_ClosePage(textPage);
     FPDF_ClosePage(page);
-    return env->NewStringUTF(recursiveJson.str().c_str());
+    return recursiveJson.str();
 
     // Legacy flat traversal retained below solely as historical reference.
     // It is unreachable because nested Form XObjects require the recursive
@@ -1123,45 +1088,25 @@ Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeGetTextObjectsJson(
     FPDF_ClosePage(page);
 
     std::string jsonStr = ss.str();
-    return env->NewStringUTF(jsonStr.c_str());
+    return jsonStr;
 }
 
-JNIEXPORT jint JNICALL
-Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeGetLastError(
-    JNIEnv* /* env */, jclass /* clazz */) {
-    return static_cast<jint>(FPDF_GetLastError());
+int lastError() {
+    return static_cast<int>(t_lastOpenError);
 }
 
-JNIEXPORT jstring JNICALL
-Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeReplaceTextObjectJson(
-    JNIEnv* env, jclass /* clazz */,
-    jstring jInputPath, jstring jOutputPath,
-    jint pageIndex, jint objectIndex,
-    jstring jReplacementText) {
+std::string replaceTextObjectJson(const std::string& inputPath, const std::string& outputPath, int pageIndex,
+                                  int objectIndex, const std::string& replacementText) {
     std::lock_guard<std::mutex> lock(g_mutex);
     ensureLibraryInitialized();
 
-    auto makeErrorJson = [&](const std::string& code, const std::string& msg) -> jstring {
+    auto makeErrorJson = [&](const std::string& code, const std::string& msg) -> std::string {
         std::string json = "{\"success\":false,\"errorCode\":\"" + escapeJsonString(code) +
                            "\",\"errorMessage\":\"" + escapeJsonString(msg) + "\"}";
-        return env->NewStringUTF(json.c_str());
+        return json;
     };
 
-    if (!jInputPath || !jOutputPath || !jReplacementText) {
-        return makeErrorJson("INVALID_ARGUMENTS", "Input path, output path, and replacement text must not be null");
-    }
 
-    const char* inputPathStr = env->GetStringUTFChars(jInputPath, nullptr);
-    const char* outputPathStr = env->GetStringUTFChars(jOutputPath, nullptr);
-    const char* repTextStr = env->GetStringUTFChars(jReplacementText, nullptr);
-
-    std::string inputPath(inputPathStr);
-    std::string outputPath(outputPathStr);
-    std::string replacementText(repTextStr);
-
-    env->ReleaseStringUTFChars(jInputPath, inputPathStr);
-    env->ReleaseStringUTFChars(jOutputPath, outputPathStr);
-    env->ReleaseStringUTFChars(jReplacementText, repTextStr);
 
     if (inputPath == outputPath) {
         return makeErrorJson("SAME_INPUT_OUTPUT", "Input path and output path must be different to preserve source immutability");
@@ -1236,6 +1181,17 @@ Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeReplaceTextObjectJson(
         }
     }
 
+    // Pre-edit text of every root-level text object and of the target, used for
+    // duplicate-safe reopen verification (exact text + occurrence counts).
+    std::vector<std::string> beforeRootTexts;
+    for (int i = 0; i < objCount; ++i) {
+        FPDF_PAGEOBJECT obj = FPDFPage_GetObject(page, i);
+        if (obj && FPDFPageObj_GetType(obj) == FPDF_PAGEOBJ_TEXT) {
+            beforeRootTexts.push_back(extractTextObjectText(obj, textPage));
+        }
+    }
+    const std::string preEditText = extractTextObjectText(targetObj, textPage);
+
     float oldLeft = 0, oldBottom = 0, oldRight = 0, oldTop = 0;
     [[maybe_unused]] FPDF_BOOL okBounds = FPDFPageObj_GetBounds(targetObj, &oldLeft, &oldBottom, &oldRight, &oldTop);
 
@@ -1282,6 +1238,17 @@ Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeReplaceTextObjectJson(
     std::string fontStrategy = "UNKNOWN";
     std::vector<std::string> limitations;
 
+    // Phase 15 glyph safety (same rule as the batch path)
+    {
+        const std::vector<uint32_t> missing = findMissingGlyphs(oldFont, replacementText, preEditText);
+        if (!missing.empty()) {
+            if (textPage) FPDFText_ClosePage(textPage);
+            FPDF_ClosePage(page);
+            FPDF_CloseDocument(doc);
+            return makeErrorJson("UNSUPPORTED_GLYPHS", unsupportedGlyphsMessage(missing, "The original font"));
+        }
+    }
+
     // Strategy 1: Direct in-place replacement via FPDFText_SetText
     // If the font can represent the replacement characters, this reuses the exact original
     // font resource (and existing matrix/color/dimensions) held by the existing object.
@@ -1319,9 +1286,14 @@ Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeReplaceTextObjectJson(
                     if (hasColor) {
                         FPDFPageObj_SetFillColor(newTextObj, r, g, b, a);
                     }
-                    FPDFPage_RemoveObject(page, targetObj);
-                    FPDFPage_InsertObject(page, newTextObj);
-                    genuineSuccess = true;
+                    if (replaceRootObjectInPlace(page, targetObj, newTextObj)) {
+                        // The original is detached and no longer referenced: free it
+                        FPDFPageObj_Destroy(targetObj);
+                        targetObj = nullptr;
+                        genuineSuccess = true;
+                    } else {
+                        FPDFPageObj_Destroy(newTextObj);
+                    }
                 } else {
                     FPDFPageObj_Destroy(newTextObj);
                 }
@@ -1337,6 +1309,11 @@ Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeReplaceTextObjectJson(
         FPDF_CloseDocument(doc);
         return makeErrorJson("TEXT_REPLACE_FAILED", "PDFium failed to replace vector text on target object");
     }
+
+    // Location of the replaced object after the edit: the same index for both strategies
+    // (Strategy 2 swaps the substituted object into the original position; count unchanged).
+    const int expectedIndex = static_cast<int>(objectIndex);
+    (void)replacedInPlace;
 
     // 7. Regenerate page content streams
     FPDF_BOOL okGen = FPDFPage_GenerateContent(page);
@@ -1409,28 +1386,21 @@ Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeReplaceTextObjectJson(
     FS_MATRIX repMatrix;
     bool hasRepMatrix = false;
 
+    // Verification inspects the replaced object itself (at its expected index) plus exact
+    // occurrence counts, never a page-wide substring match.
+    std::vector<std::string> afterRootTexts;
+    bool expectedObjectFound = false;
+    std::string expectedObjectText;
     for (int i = 0; i < newObjCount; ++i) {
         FPDF_PAGEOBJECT obj = FPDFPage_GetObject(newPage, i);
         if (!obj || FPDFPageObj_GetType(obj) != FPDF_PAGEOBJ_TEXT) continue;
 
-        std::string txt;
-        if (newTextPage) {
-            unsigned long len = FPDFTextObj_GetText(obj, newTextPage, nullptr, 0);
-            if (len > 0) {
-                std::vector<FPDF_WCHAR> wbuf(len / sizeof(FPDF_WCHAR) + 1, 0);
-                unsigned long rBytes = FPDFTextObj_GetText(obj, newTextPage, wbuf.data(), len);
-                if (rBytes > 0) {
-                    txt = utf16ToUtf8(wbuf.data(), rBytes / sizeof(FPDF_WCHAR));
-                }
-            }
-        }
+        const std::string txt = extractTextObjectText(obj, newTextPage);
+        afterRootTexts.push_back(txt);
 
-        if (!oldText.empty() && txt == oldText) {
-            oldTextStillPresentInReopened = true;
-        }
-
-        if (txt == replacementText || (!replacementText.empty() && txt.find(replacementText) != std::string::npos)) {
-            replacementFoundInReopened = true;
+        if (i == expectedIndex) {
+            expectedObjectFound = true;
+            expectedObjectText = txt;
             reopenedObjId = "p" + std::to_string(pageIndex) + "_obj" + std::to_string(i);
             reopenedText = txt;
 
@@ -1474,6 +1444,27 @@ Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeReplaceTextObjectJson(
     if (newTextPage) FPDFText_ClosePage(newTextPage);
     FPDF_ClosePage(newPage);
     FPDF_CloseDocument(newDoc);
+
+    {
+        std::vector<pie::PageVerifyInput> verifyInputs(1);
+        verifyInputs[0].type = "replace";
+        verifyInputs[0].preText = preEditText;
+        verifyInputs[0].newText = replacementText;
+        verifyInputs[0].objectFound = expectedObjectFound;
+        verifyInputs[0].objectText = expectedObjectText;
+        pie::verifyPageEdits(beforeRootTexts, afterRootTexts, verifyInputs);
+        replacementFoundInReopened = verifyInputs[0].verified;
+        if (!replacementFoundInReopened) {
+            limitations.push_back("Reopen verification failed: " + verifyInputs[0].error);
+        }
+
+        const std::string pre = pie::normalizeVerifyText(preEditText);
+        if (!pre.empty() && pre != pie::normalizeVerifyText(replacementText)) {
+            const int beforeCount = pie::countOf(pie::countNormalizedTexts(beforeRootTexts), pre);
+            const int afterCount = pie::countOf(pie::countNormalizedTexts(afterRootTexts), pre);
+            oldTextStillPresentInReopened = afterCount > beforeCount - 1;
+        }
+    }
 
     bool fontReused = (replacedInPlace && (reopenedFontName == oldFontName || (!oldFontName.empty() && reopenedFontName.find(oldFontName) != std::string::npos)));
     if (fontReused) {
@@ -1563,44 +1554,33 @@ Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeReplaceTextObjectJson(
     ss << "}";
 
     std::string outJson = ss.str();
-    return env->NewStringUTF(outJson.c_str());
+    return outJson;
 }
 
-JNIEXPORT jstring JNICALL
-Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeApplyBatchEditsJson(
-    JNIEnv* env, jclass /* clazz */,
-    jstring jInputPath, jstring jOutputPath,
-    jstring jEditsJson) {
+std::string applyBatchEditsJson(const std::string& inputPath, const std::string& outputPath,
+                                const std::string& editsJson) {
     std::lock_guard<std::mutex> lock(g_mutex);
     ensureLibraryInitialized();
 
-    auto makeErrorJson = [&](const std::string& code, const std::string& msg) -> jstring {
+    auto makeErrorJson = [&](const std::string& code, const std::string& msg) -> std::string {
         std::string json = "{\"success\":false,\"errorCode\":\"" + escapeJsonString(code) +
                            "\",\"errorMessage\":\"" + escapeJsonString(msg) + "\"}";
-        return env->NewStringUTF(json.c_str());
+        return json;
     };
 
-    if (!jInputPath || !jOutputPath || !jEditsJson) {
-        return makeErrorJson("INVALID_ARGUMENTS", "Input path, output path, and edits JSON must not be null");
-    }
 
-    const char* inputPathStr = env->GetStringUTFChars(jInputPath, nullptr);
-    const char* outputPathStr = env->GetStringUTFChars(jOutputPath, nullptr);
-    const char* editsJsonStr = env->GetStringUTFChars(jEditsJson, nullptr);
-
-    std::string inputPath(inputPathStr);
-    std::string outputPath(outputPathStr);
-    std::string editsJson(editsJsonStr);
-
-    env->ReleaseStringUTFChars(jInputPath, inputPathStr);
-    env->ReleaseStringUTFChars(jOutputPath, outputPathStr);
-    env->ReleaseStringUTFChars(jEditsJson, editsJsonStr);
 
     if (inputPath == outputPath) {
         return makeErrorJson("SAME_INPUT_OUTPUT", "Input path and output path must be different to preserve source immutability");
     }
 
-    std::vector<EditCommand> commands = parseEditCommands(editsJson);
+    // A malformed batch is an error, never a silent zero-command copy. "[]" (copyDocument)
+    // is valid and yields zero commands.
+    std::vector<EditCommand> commands;
+    std::string parseError;
+    if (!pie::parseEditCommands(editsJson, commands, parseError)) {
+        return makeErrorJson("INVALID_EDITS_JSON", "Edit batch JSON could not be parsed: " + parseError);
+    }
 
     // 1. Source immutability verification: Checksum before operation
     std::string hashBefore = computeFileChecksum(inputPath);
@@ -1641,6 +1621,27 @@ Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeApplyBatchEditsJson(
         std::string error;
         std::vector<std::string> unsupportedFormatting;
         bool verifiedInReopened = false;
+        std::string verificationError;
+        // Reopen verification bookkeeping
+        std::string preText;                     // text of the targeted object before editing
+        FPDF_PAGEOBJECT resultObject = nullptr;  // object holding the edit (valid until page close)
+        std::vector<int> expectedPath;           // location of resultObject in the saved page
+        bool hasExpectedPath = false;
+        long supersededBy = -1;                  // later command in this batch that replaced/deleted resultObject
+    };
+
+    // Text of every text object per edited page before editing (verification baseline)
+    std::map<int, std::vector<std::string>> beforeTextsByPage;
+
+    // Marks earlier commands whose edited object is edited again (or deleted) by `ci`.
+    auto supersedeEarlierEdits = [](std::vector<CommandResult>& all, const std::vector<size_t>& indices,
+                                     size_t ci, FPDF_PAGEOBJECT object) {
+        for (size_t other : indices) {
+            if (other != ci && all[other].resultObject == object) {
+                all[other].supersededBy = static_cast<long>(ci);
+                all[other].resultObject = nullptr;
+            }
+        }
     };
 
     std::vector<CommandResult> results(commands.size());
@@ -1664,6 +1665,12 @@ Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeApplyBatchEditsJson(
             return makeErrorJson("PDF_PAGE_LOAD_FAILED", "Failed to load page " + std::to_string(pageIndex));
         }
 
+        // User space -> displayed page (rotation / crop box), used to orient inserted text
+        const FS_MATRIX pageDisplay = pageDisplayMatrix(doc, page, pageIndex);
+
+        // Objects detached by font substitution; freed once the page's edits are finished
+        std::vector<FPDF_PAGEOBJECT> detachedObjects;
+
         // Map command index -> target FPDF_PAGEOBJECT (for replace and delete)
         std::map<size_t, ResolvedObjectPath> resolvedObjects;
         for (size_t ci : cmdIndices) {
@@ -1682,6 +1689,50 @@ Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeApplyBatchEditsJson(
             resolvedObjects[ci] = resolved;
         }
 
+        // Text inside a Form XObject: convert the enclosing (outermost) form into page content
+        // first, so the edit is actually written on save. Resolved object pointers stay valid.
+        for (auto& resolvedEntry : resolvedObjects) {
+            if (!resolvedEntry.second.parentForm) continue;
+            FPDF_PAGEOBJECT target = resolvedEntry.second.object;
+            std::vector<int> where;
+            std::string flattenError;
+            bool ok = true;
+            while (ok && locateObjectPath(page, target, where) && where.size() > 1) {
+                ok = flattenRootForm(page, FPDFPage_GetObject(page, where[0]), flattenError);
+            }
+            if (!ok) {
+                results[resolvedEntry.first].error = flattenError;
+                continue;
+            }
+            resolvedEntry.second.parentForm = nullptr;
+            commands[resolvedEntry.first].objectPath = where;
+        }
+        for (auto it = resolvedObjects.begin(); it != resolvedObjects.end();) {
+            if (!results[it->first].error.empty()) it = resolvedObjects.erase(it);
+            else ++it;
+        }
+
+        // Pre-edit snapshot for reopen verification: text of every text object on the page
+        // (whole object tree) and of each targeted object. The text page is closed before
+        // any object is modified.
+        {
+            FPDF_TEXTPAGE preTextPage = FPDFText_LoadPage(page);
+            std::vector<std::string>& beforeTexts = beforeTextsByPage[pageIndex];
+            const int rootCount = FPDFPage_CountObjects(page);
+            for (int i = 0; i < rootCount; ++i) {
+                collectTextObjectStrings(FPDFPage_GetObject(page, i), preTextPage, beforeTexts);
+            }
+            for (const auto& resolvedEntry : resolvedObjects) {
+                std::vector<int> path = commands[resolvedEntry.first].objectPath;
+                if (path.empty()) path.push_back(commands[resolvedEntry.first].objectIndex);
+                std::string text;
+                if (extractTextAtPath(page, preTextPage, path, text)) {
+                    results[resolvedEntry.first].preText = text;
+                }
+            }
+            if (preTextPage) FPDFText_ClosePage(preTextPage);
+        }
+
         // Execute Replacements on this page
         for (size_t ci : cmdIndices) {
             if (commands[ci].type != "replace") continue;
@@ -1697,6 +1748,7 @@ Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeApplyBatchEditsJson(
 
             std::vector<FPDF_WCHAR> wideRep = utf8ToUtf16(commands[ci].newText);
             bool replaced = false;
+            FPDF_PAGEOBJECT editedObject = nullptr;
 
             // Inspect original font details
             FPDF_FONT origFont = FPDFTextObj_GetFont(targetObj);
@@ -1733,6 +1785,24 @@ Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeApplyBatchEditsJson(
                 continue;
             }
 
+            // Phase 15 glyph safety: the original font must contain every new character
+            // (characters it already renders in this object are trusted). Otherwise the edit
+            // fails clearly instead of producing missing/substituted glyphs.
+            if (!fontChangeRequested) {
+                const std::vector<uint32_t> missing = findMissingGlyphs(origFont, commands[ci].newText, results[ci].preText);
+                if (!missing.empty()) {
+                    results[ci].error = unsupportedGlyphsMessage(
+                        missing, "The original font" + (origFontName.empty() ? std::string() : " (" + origFontName + ")"));
+                    continue;
+                }
+            }
+
+            // Reflow: the run that follows the object on its line, before the edit
+            PieBox reflowOld;
+            const bool canReflow = commands[ci].reflow && !parentForm && pieUprightTextBox(targetObj, reflowOld);
+            std::vector<std::pair<FPDF_PAGEOBJECT, PieBox>> reflowRun;
+            if (canReflow) reflowRun = pieFollowingRun(page, reflowOld, reflowOld.r, {targetObj});
+
             // Strategy 1: Direct in-place replacement (reusing original font resource)
             if (!fontChangeRequested && FPDFText_SetText(targetObj, (FPDF_WIDESTRING)wideRep.data())) {
                 if (commands[ci].hasFontSize && commands[ci].fontSize > 0) {
@@ -1742,12 +1812,19 @@ Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeApplyBatchEditsJson(
                     FPDFPageObj_SetFillColor(targetObj, commands[ci].colorR, commands[ci].colorG, commands[ci].colorB, commands[ci].colorA);
                 }
                 replaced = true;
+                editedObject = targetObj;
                 results[ci].fontStrategy = "REUSED_ORIGINAL";
                 results[ci].fontReused = true;
             } else if (parentForm) {
                 results[ci].error = "Nested Form XObject text replacement failed: glyph not available in original font resource";
             } else {
                 // Strategy 2: Reconstruct text object with requested or fallback font (root-level only)
+                // Standard 14 fonts only cover WinAnsi: anything else would render as missing glyphs.
+                const std::vector<uint32_t> nonWinAnsi = pie::findNonWinAnsiCodePoints(commands[ci].newText);
+                if (!nonWinAnsi.empty()) {
+                    results[ci].error = unsupportedGlyphsMessage(nonWinAnsi, "The standard PDF fonts");
+                    continue;
+                }
                 float fontSizeToUse = 12.0f;
                 if (commands[ci].hasFontSize && commands[ci].fontSize > 0) {
                     fontSizeToUse = static_cast<float>(commands[ci].fontSize);
@@ -1790,11 +1867,16 @@ Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeApplyBatchEditsJson(
                         if (FPDFText_SetText(newTextObj, (FPDF_WIDESTRING)wideRep.data())) {
                             if (hasMatrix) FPDFPageObj_SetMatrix(newTextObj, &matrix);
                             FPDFPageObj_SetFillColor(newTextObj, r, g, b, a);
-                            FPDFPage_RemoveObject(page, targetObj);
-                            FPDFPage_InsertObject(page, newTextObj);
-                            replaced = true;
-                            results[ci].fontStrategy = "LOADED_STANDARD";
-                            results[ci].fontReused = false;
+                            if (replaceRootObjectInPlace(page, targetObj, newTextObj)) {
+                                detachedObjects.push_back(targetObj);
+                                replaced = true;
+                                editedObject = newTextObj;
+                                results[ci].fontStrategy = "LOADED_STANDARD";
+                                results[ci].fontReused = false;
+                            } else {
+                                FPDFPageObj_Destroy(newTextObj);
+                                results[ci].error = "The substituted text object could not replace the original";
+                            }
                         } else {
                             FPDFPageObj_Destroy(newTextObj);
                         }
@@ -1803,31 +1885,88 @@ Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeApplyBatchEditsJson(
                 }
             }
 
+            if (replaced && canReflow) {
+                PieBox reflowNew;
+                if (pieUprightTextBox(editedObject, reflowNew)) pieShiftRun(reflowRun, reflowNew.r - reflowOld.r);
+            }
+
             if (replaced) {
+                supersedeEarlierEdits(results, cmdIndices, ci, targetObj);
                 results[ci].applied = true;
+                results[ci].resultObject = editedObject;
             } else if (results[ci].error.empty()) {
                 results[ci].error = "FPDFText_SetText failed on object";
             }
         }
 
         // Execute Deletions on this page
+        std::vector<PieBox> reflowDeleted;  // boxes of reflow deletions (page space, before removal)
         for (size_t ci : cmdIndices) {
             if (commands[ci].type != "delete") continue;
             auto it = resolvedObjects.find(ci);
             if (it == resolvedObjects.end()) continue;
             FPDF_PAGEOBJECT targetObj = it->second.object;
             FPDF_PAGEOBJECT parentForm = it->second.parentForm;
+            PieBox deletedBox;
+            const bool reflowThis = commands[ci].reflow && !parentForm && pieUprightTextBox(targetObj, deletedBox);
 
             const bool removed = parentForm
                 ? FPDFFormObj_RemoveObject(parentForm, targetObj)
                 : FPDFPage_RemoveObject(page, targetObj);
             if (removed) {
+                supersedeEarlierEdits(results, cmdIndices, ci, targetObj);
                 FPDFPageObj_Destroy(targetObj);
                 results[ci].applied = true;
+                if (reflowThis) reflowDeleted.push_back(deletedBox);
             } else {
                 results[ci].error = parentForm
                     ? "FPDFFormObj_RemoveObject failed"
                     : "FPDFPage_RemoveObject failed";
+            }
+        }
+
+        // Reflow deletions: per line, contiguous deleted spans close up. The first remaining text
+        // after a span moves to where the span started (exact for whole words, whatever the
+        // glyph side bearings), carrying the rest of its run. Spans are processed right to left
+        // so shifts accumulate correctly.
+        if (!reflowDeleted.empty()) {
+            std::sort(reflowDeleted.begin(), reflowDeleted.end(),
+                      [](const PieBox& x, const PieBox& y) { return x.l < y.l; });
+            std::vector<std::pair<PieBox, std::vector<PieBox>>> lines;  // line box, its boxes
+            for (const PieBox& box : reflowDeleted) {
+                bool placed = false;
+                for (auto& line : lines) {
+                    if (pieSameLine(line.first, box)) {
+                        line.second.push_back(box);
+                        placed = true;
+                        break;
+                    }
+                }
+                if (!placed) lines.push_back({box, {box}});
+            }
+            for (auto& line : lines) {
+                // Merge into spans: consecutive deleted boxes with no remaining text between them
+                std::vector<PieBox> spans;
+                for (const PieBox& box : line.second) {
+                    if (!spans.empty()) {
+                        PieBox& last = spans.back();
+                        auto between = pieFollowingRun(page, line.first, last.r, {});
+                        const bool remainingBetween =
+                            !between.empty() && between.front().second.l < box.l - 0.5f;
+                        if (!remainingBetween) {
+                            last.r = std::max(last.r, box.r);
+                            last.b = std::min(last.b, box.b);
+                            last.t = std::max(last.t, box.t);
+                            continue;
+                        }
+                    }
+                    spans.push_back(box);
+                }
+                for (auto span = spans.rbegin(); span != spans.rend(); ++span) {
+                    auto run = pieFollowingRun(page, line.first, span->r, {});
+                    if (run.empty()) continue;
+                    pieShiftRun(run, span->l - run.front().second.l);
+                }
             }
         }
 
@@ -1837,6 +1976,14 @@ Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeApplyBatchEditsJson(
             if (commands[ci].text.empty()) {
                 results[ci].error = "Inserted text cannot be empty";
                 continue;
+            }
+            {
+                // Inserted text uses a standard 14 font (WinAnsi only).
+                const std::vector<uint32_t> nonWinAnsi = pie::findNonWinAnsiCodePoints(commands[ci].text);
+                if (!nonWinAnsi.empty()) {
+                    results[ci].error = unsupportedGlyphsMessage(nonWinAnsi, "The standard PDF fonts");
+                    continue;
+                }
             }
 
             std::string fontName = commands[ci].fontName.empty() ? "Helvetica" : commands[ci].fontName;
@@ -1868,11 +2015,16 @@ Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeApplyBatchEditsJson(
             // Set fill color
             FPDFPageObj_SetFillColor(newObj, commands[ci].colorR, commands[ci].colorG, commands[ci].colorB, commands[ci].colorA);
 
-            // Position: transform by (1, 0, 0, 1, x, y)
-            FPDFPageObj_Transform(newObj, 1.0, 0.0, 0.0, 1.0, commands[ci].x, commands[ci].y);
+            // Position at the user-space baseline origin (x, y). On rotated pages the text is
+            // counter-rotated so it reads upright in the displayed page; unrotated pages get the
+            // identity basis (1, 0, 0, 1) exactly as before.
+            float ta = 1, tb = 0, tc = 0, td = 1;
+            uprightTextBasis(pageDisplay, ta, tb, tc, td);
+            FPDFPageObj_Transform(newObj, ta, tb, tc, td, commands[ci].x, commands[ci].y);
 
             if (FPDFPage_InsertObject(page, newObj)) {
                 results[ci].applied = true;
+                results[ci].resultObject = newObj;
                 results[ci].fontStrategy = "LOADED_STANDARD";
                 results[ci].newText = commands[ci].text;
             } else {
@@ -1882,8 +2034,29 @@ Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeApplyBatchEditsJson(
             FPDFFont_Close(insertFont);
         }
 
-        // Regenerate page content once per modified page
-        FPDFPage_GenerateContent(page);
+        // Regenerate page content once per modified page. A failure here would save a page whose
+        // content stream does not reflect the edits, so it fails the whole batch.
+        if (!FPDFPage_GenerateContent(page)) {
+            for (FPDF_PAGEOBJECT o : detachedObjects) FPDFPageObj_Destroy(o);
+            FPDF_ClosePage(page);
+            FPDF_CloseDocument(doc);
+            return makeErrorJson("GENERATE_CONTENT_FAILED",
+                                 "FPDFPage_GenerateContent failed to rebuild page " + std::to_string(pageIndex));
+        }
+
+        // Record where each edited object sits in the page's object tree (content is written
+        // in this order, so the reopened page has the same structure). Object pointers are
+        // never used after the page is closed.
+        for (size_t ci : cmdIndices) {
+            if (!results[ci].applied || !results[ci].resultObject) continue;
+            results[ci].hasExpectedPath = locateObjectPath(page, results[ci].resultObject, results[ci].expectedPath);
+            results[ci].resultObject = nullptr;
+        }
+
+        // Nothing refers to the substituted originals any more (same document, still open)
+        for (FPDF_PAGEOBJECT o : detachedObjects) FPDFPageObj_Destroy(o);
+        detachedObjects.clear();
+
         FPDF_ClosePage(page);
     }
 
@@ -1915,47 +2088,72 @@ Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeApplyBatchEditsJson(
 
     int pageCountAfter = FPDF_GetPageCount(newDoc);
 
-    // Scan each modified page in reopened document
+    // Verify every applied command against the reopened document: the edited object itself
+    // (located by its recorded object path) must hold exactly the requested text, and exact
+    // occurrence counts on the page must match the expected result, so duplicate text
+    // elsewhere on the page cannot produce a false verification (see pie::verifyPageEdits).
     for (auto& entry : pageToCmdIndices) {
         int pageIndex = entry.first;
         const auto& cmdIndices = entry.second;
 
-        FPDF_PAGE newPage = FPDF_LoadPage(newDoc, pageIndex);
-        if (!newPage) continue;
+        std::vector<size_t> verifyIndices;
+        for (size_t ci : cmdIndices) {
+            if (results[ci].applied && results[ci].supersededBy < 0) verifyIndices.push_back(ci);
+        }
+        if (verifyIndices.empty()) continue;
 
-        FPDF_TEXTPAGE newTextPage = FPDFText_LoadPage(newPage);
-        std::vector<std::string> pageTexts;
-        const int newRootObjectCount = FPDFPage_CountObjects(newPage);
-        for (int i = 0; i < newRootObjectCount; ++i) {
-            collectTextObjectStrings(FPDFPage_GetObject(newPage, i), newTextPage, pageTexts);
+        if (pageCountAfter != pageCountBefore) {
+            for (size_t ci : verifyIndices) {
+                results[ci].verificationError = "Reopened document page count differs from the source";
+            }
+            continue;
         }
 
-        for (size_t ci : cmdIndices) {
-            if (!results[ci].applied) continue;
-
-            if (results[ci].type == "replace" || results[ci].type == "insert") {
-                bool foundNew = false;
-                for (const auto& t : pageTexts) {
-                    if (t == results[ci].newText || t.find(results[ci].newText) != std::string::npos) {
-                        foundNew = true;
-                        break;
-                    }
-                }
-                results[ci].verifiedInReopened = foundNew;
-            } else if (results[ci].type == "delete") {
-                bool foundOld = false;
-                for (const auto& t : pageTexts) {
-                    if (t == results[ci].originalText && !results[ci].originalText.empty()) {
-                        foundOld = true;
-                        break;
-                    }
-                }
-                results[ci].verifiedInReopened = !foundOld;
+        FPDF_PAGE newPage = FPDF_LoadPage(newDoc, pageIndex);
+        if (!newPage) {
+            for (size_t ci : verifyIndices) {
+                results[ci].verificationError = "Edited page could not be loaded from the reopened document";
             }
+            continue;
+        }
+
+        FPDF_TEXTPAGE newTextPage = FPDFText_LoadPage(newPage);
+        std::vector<std::string> afterTexts;
+        const int newRootObjectCount = FPDFPage_CountObjects(newPage);
+        for (int i = 0; i < newRootObjectCount; ++i) {
+            collectTextObjectStrings(FPDFPage_GetObject(newPage, i), newTextPage, afterTexts);
+        }
+
+        std::vector<pie::PageVerifyInput> inputs(verifyIndices.size());
+        for (size_t k = 0; k < verifyIndices.size(); ++k) {
+            const CommandResult& r = results[verifyIndices[k]];
+            inputs[k].type = r.type;
+            inputs[k].preText = r.preText;
+            inputs[k].newText = r.newText;
+            if ((r.type == "replace" || r.type == "insert") && r.hasExpectedPath) {
+                inputs[k].objectFound = extractTextAtPath(newPage, newTextPage, r.expectedPath, inputs[k].objectText);
+            }
+        }
+        pie::verifyPageEdits(beforeTextsByPage[pageIndex], afterTexts, inputs);
+        for (size_t k = 0; k < verifyIndices.size(); ++k) {
+            results[verifyIndices[k]].verifiedInReopened = inputs[k].verified;
+            results[verifyIndices[k]].verificationError = inputs[k].error;
         }
 
         if (newTextPage) FPDFText_ClosePage(newTextPage);
         FPDF_ClosePage(newPage);
+    }
+
+    // An edit superseded within this batch (its object was edited again or deleted by a later
+    // command) is verified through the command that superseded it.
+    for (size_t ci = 0; ci < results.size(); ++ci) {
+        if (!results[ci].applied || results[ci].supersededBy < 0) continue;
+        size_t last = static_cast<size_t>(results[ci].supersededBy);
+        for (size_t guard = 0; guard < results.size() && results[last].supersededBy >= 0; ++guard) {
+            last = static_cast<size_t>(results[last].supersededBy);
+        }
+        results[ci].verifiedInReopened = results[last].verifiedInReopened;
+        results[ci].verificationError = results[last].verificationError;
     }
 
     FPDF_CloseDocument(newDoc);
@@ -1985,6 +2183,7 @@ Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeApplyBatchEditsJson(
         ss << "\"newText\":\"" << escapeJsonString(results[ci].newText) << "\",";
         ss << "\"applied\":" << (results[ci].applied ? "true" : "false") << ",";
         ss << "\"verifiedInReopened\":" << (results[ci].verifiedInReopened ? "true" : "false") << ",";
+        ss << "\"verificationError\":\"" << escapeJsonString(results[ci].verificationError) << "\",";
         ss << "\"fontStrategy\":\"" << escapeJsonString(results[ci].fontStrategy) << "\",";
         ss << "\"fontReused\":" << (results[ci].fontReused ? "true" : "false") << ",";
         ss << "\"error\":\"" << escapeJsonString(results[ci].error) << "\"";
@@ -1995,7 +2194,336 @@ Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeApplyBatchEditsJson(
     ss << "}";
 
     std::string outJson = ss.str();
-    return env->NewStringUTF(outJson.c_str());
+    return outJson;
+}
+
+std::string applyDocumentOperationsJson(const std::string& inputPath, const std::string& outputPath,
+                                        const std::string& opsJson) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    ensureLibraryInitialized();
+    return pie_pdf::applyDocumentOperationsJson(inputPath, outputPath, opsJson);
+}
+
+std::string mergeDocumentsJson(const std::string& inputsJson, const std::string& outputPath) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    ensureLibraryInitialized();
+    return pie_pdf::mergeDocumentsJson(inputsJson, outputPath);
+}
+
+std::string createPdfFromImagesJson(const std::string& specJson, const std::string& outputPath) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    ensureLibraryInitialized();
+    return pie_pdf::createPdfFromImagesJson(specJson, outputPath);
+}
+
+std::string searchDocumentJson(int64_t docHandle, const std::string& query, int maxResults) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return pie_pdf::searchDocumentJson(getDoc(docHandle), query, maxResults);
+}
+
+std::string pageTextJson(int64_t docHandle, int pageIndex) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return pie_pdf::pageTextJson(getDoc(docHandle), pageIndex);
+}
+
+}  // namespace pie_engine
+
+
+namespace {
+
+void pieIndexObjects(FPDF_PAGEOBJECT object, std::vector<int>& path,
+                     std::unordered_map<FPDF_PAGEOBJECT, std::vector<int>>& out) {
+    if (!object) return;
+    const int type = FPDFPageObj_GetType(object);
+    if (type == FPDF_PAGEOBJ_TEXT) {
+        out[object] = path;
+        return;
+    }
+    if (type != FPDF_PAGEOBJ_FORM) return;
+    const int n = FPDFFormObj_CountObjects(object);
+    for (int i = 0; i < n; ++i) {
+        path.push_back(i);
+        pieIndexObjects(FPDFFormObj_GetObject(object, static_cast<unsigned long>(i)), path, out);
+        path.pop_back();
+    }
+}
+
+}  // namespace
+
+namespace pie_engine {
+
+/**
+ * Characters of a page in reading order (PDFium text page), for character-level selection:
+ *   {"pageIndex":n,"objects":["p0_path3", ...],
+ *    "chars":[[codepoint, x, y, w, h, baselineY, objectIdx, offsetInObject, generated], ...]}
+ * Boxes are display-space (rotation / crop box applied, top-left origin) loose character boxes
+ * (font ascent to descent, so a line's characters share top and bottom); baselineY is the
+ * display-space y of the character origin. objectIdx indexes "objects" (ids identical to
+ * getTextObjectsJson) or is -1 for characters PDFium generated (spaces / line breaks between
+ * runs). offsetInObject counts the object's own characters in reading order.
+ */
+std::string pageCharsJson(int64_t docHandle, int pageIndex) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    FPDF_DOCUMENT doc = getDoc(docHandle);
+    if (!doc) return "{\"pageIndex\":" + std::to_string(pageIndex) + ",\"objects\":[],\"chars\":[]}";
+    FPDF_PAGE page = FPDF_LoadPage(doc, pageIndex);
+    if (!page) return "{\"pageIndex\":" + std::to_string(pageIndex) + ",\"objects\":[],\"chars\":[]}";
+    FPDF_TEXTPAGE textPage = FPDFText_LoadPage(page);
+    const FS_MATRIX display = pageDisplayMatrix(doc, page, pageIndex);
+
+    std::unordered_map<FPDF_PAGEOBJECT, std::vector<int>> paths;
+    {
+        std::vector<int> path;
+        const int rootCount = FPDFPage_CountObjects(page);
+        for (int i = 0; i < rootCount; ++i) {
+            path.assign(1, i);
+            pieIndexObjects(FPDFPage_GetObject(page, i), path, paths);
+        }
+    }
+
+    std::unordered_map<FPDF_PAGEOBJECT, int> objectIndex;
+    std::unordered_map<FPDF_PAGEOBJECT, int> objectOffset;
+    std::vector<std::string> objectIds;
+    std::ostringstream chars;
+    chars << std::fixed << std::setprecision(2);
+    const int count = textPage ? FPDFText_CountChars(textPage) : 0;
+    bool first = true;
+    for (int i = 0; i < count; ++i) {
+        const unsigned int cp = FPDFText_GetUnicode(textPage, i);
+        FS_RECTF r{0, 0, 0, 0};
+        if (!FPDFText_GetLooseCharBox(textPage, i, &r)) continue;
+        float dl, db, dr, dt;
+        transformBounds(display, r.left, r.bottom, r.right, r.top, dl, db, dr, dt);
+        double ox = 0, oy = 0;
+        float bx = 0, by = dt;
+        if (FPDFText_GetCharOrigin(textPage, i, &ox, &oy)) {
+            transformPoint(display, static_cast<float>(ox), static_cast<float>(oy), bx, by);
+        }
+        const bool generated = FPDFText_IsGenerated(textPage, i) == 1;
+        int objIdx = -1;
+        int offset = 0;
+        if (!generated) {
+            FPDF_PAGEOBJECT obj = FPDFText_GetTextObject(textPage, i);
+            auto p = obj ? paths.find(obj) : paths.end();
+            if (p != paths.end()) {
+                auto known = objectIndex.find(obj);
+                if (known == objectIndex.end()) {
+                    objIdx = static_cast<int>(objectIds.size());
+                    objectIndex[obj] = objIdx;
+                    objectIds.push_back(objectPathId(pageIndex, p->second));
+                } else {
+                    objIdx = known->second;
+                }
+                offset = objectOffset[obj]++;
+            }
+        }
+        if (!first) chars << ",";
+        first = false;
+        // display rect: transformBounds returns display-space min/max with y "bottom" = min
+        chars << "[" << cp << "," << dl << "," << db << "," << (dr - dl) << "," << (dt - db) << "," << by << ","
+              << objIdx << "," << offset << "," << (generated ? 1 : 0) << "]";
+    }
+    if (textPage) FPDFText_ClosePage(textPage);
+    FPDF_ClosePage(page);
+
+    std::ostringstream out;
+    out << "{\"pageIndex\":" << pageIndex << ",\"objects\":[";
+    for (size_t k = 0; k < objectIds.size(); ++k) {
+        if (k) out << ",";
+        out << "\"" << escapeJsonString(objectIds[k]) << "\"";
+    }
+    out << "],\"chars\":[" << chars.str() << "]}";
+    return out.str();
+}
+
+}  // namespace pie_engine
+
+// ---------------------------------------------------------------------------
+// Android JNI wrappers (string / bitmap plumbing only; logic is in pie_engine)
+// ---------------------------------------------------------------------------
+#if defined(__ANDROID__)
+
+namespace {
+
+std::string jniErrorJson(const std::string& code, const std::string& msg) {
+    return "{\"success\":false,\"errorCode\":\"" + escapeJsonString(code) +
+           "\",\"errorMessage\":\"" + escapeJsonString(msg) + "\"}";
+}
+
+// Locks an Android ARGB_8888 bitmap and passes its pixels to `render`.
+template <typename Fn>
+jboolean withBitmapPixels(JNIEnv* env, jobject jBitmap, Fn render) {
+    if (!jBitmap) return JNI_FALSE;
+    AndroidBitmapInfo info;
+    if (AndroidBitmap_getInfo(env, jBitmap, &info) < 0) {
+        LOGE("AndroidBitmap_getInfo failed");
+        return JNI_FALSE;
+    }
+    void* pixels = nullptr;
+    if (AndroidBitmap_lockPixels(env, jBitmap, &pixels) < 0 || !pixels) {
+        LOGE("AndroidBitmap_lockPixels failed");
+        return JNI_FALSE;
+    }
+    const bool ok = render(pixels, static_cast<int>(info.width), static_cast<int>(info.height), static_cast<int>(info.stride));
+    AndroidBitmap_unlockPixels(env, jBitmap);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+}  // namespace
+
+extern "C" {
+
+JNIEXPORT void JNICALL
+Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeInit(JNIEnv* /* env */, jclass /* clazz */) {
+    pie_engine::initLibrary();
+}
+
+JNIEXPORT void JNICALL
+Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeDestroy(JNIEnv* /* env */, jclass /* clazz */) {
+    pie_engine::destroyLibrary();
+}
+
+JNIEXPORT jlong JNICALL
+Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeOpenDocument(
+    JNIEnv* env, jclass /* clazz */, jstring jFilePath, jstring jPassword) {
+    if (!jFilePath) {
+        LOGE("nativeOpenDocument: File path is null");
+        return 0;
+    }
+    const std::string filePath = jstringToUtf8(env, jFilePath);
+    const std::string password = jstringToUtf8(env, jPassword);
+    return pie_engine::openDocument(filePath, jPassword ? password.c_str() : nullptr);
+}
+
+JNIEXPORT void JNICALL
+Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeCloseDocument(
+    JNIEnv* /* env */, jclass /* clazz */, jlong docHandle) {
+    pie_engine::closeDocument(docHandle);
+}
+
+JNIEXPORT jint JNICALL
+Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeGetPageCount(
+    JNIEnv* /* env */, jclass /* clazz */, jlong docHandle) {
+    return pie_engine::getPageCount(docHandle);
+}
+
+JNIEXPORT jdoubleArray JNICALL
+Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeGetPageSize(
+    JNIEnv* env, jclass /* clazz */, jlong docHandle, jint pageIndex) {
+    double width = 0.0, height = 0.0;
+    if (!pie_engine::getPageSize(docHandle, pageIndex, width, height)) {
+        LOGE("nativeGetPageSize: Failed to get page size for index %d", pageIndex);
+        return nullptr;
+    }
+    jdoubleArray result = env->NewDoubleArray(2);
+    jdouble dims[2] = { width, height };
+    env->SetDoubleArrayRegion(result, 0, 2, dims);
+    return result;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeRenderPageToBitmap(
+    JNIEnv* env, jclass /* clazz */, jlong docHandle, jint pageIndex, jobject jBitmap) {
+    return withBitmapPixels(env, jBitmap, [&](void* pixels, int w, int h, int stride) {
+        // ARGB_8888 stores R,G,B,A in memory: reverse PDFium's BGRA byte order.
+        return pie_engine::renderPageToBuffer(docHandle, pageIndex, pixels, w, h, stride, true);
+    });
+}
+
+JNIEXPORT jdoubleArray JNICALL
+Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeGetPageGeometry(
+    JNIEnv* env, jclass /* clazz */, jlong docHandle, jint pageIndex) {
+    double values[9];
+    if (!pie_engine::getPageGeometry(docHandle, pageIndex, values)) return nullptr;
+    jdoubleArray result = env->NewDoubleArray(9);
+    env->SetDoubleArrayRegion(result, 0, 9, values);
+    return result;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeRenderPageRegionToBitmap(
+    JNIEnv* env, jclass /* clazz */, jlong docHandle, jint pageIndex, jobject jBitmap,
+    jdouble scale, jdouble left, jdouble top) {
+    return withBitmapPixels(env, jBitmap, [&](void* pixels, int w, int h, int stride) {
+        return pie_engine::renderRegionToBuffer(docHandle, pageIndex, pixels, w, h, stride, scale, left, top, true);
+    });
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeGetTextObjectsJson(
+    JNIEnv* env, jclass /* clazz */, jlong docHandle, jint pageIndex) {
+    return utf8ToJstring(env, pie_engine::getTextObjectsJson(docHandle, pageIndex));
+}
+
+JNIEXPORT jint JNICALL
+Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeGetLastError(
+    JNIEnv* /* env */, jclass /* clazz */) {
+    return static_cast<jint>(pie_engine::lastError());
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeReplaceTextObjectJson(
+    JNIEnv* env, jclass /* clazz */,
+    jstring jInputPath, jstring jOutputPath,
+    jint pageIndex, jint objectIndex,
+    jstring jReplacementText) {
+    if (!jInputPath || !jOutputPath || !jReplacementText) {
+        return utf8ToJstring(env, jniErrorJson("INVALID_ARGUMENTS", "Input path, output path, and replacement text must not be null"));
+    }
+    return utf8ToJstring(env, pie_engine::replaceTextObjectJson(
+        jstringToUtf8(env, jInputPath), jstringToUtf8(env, jOutputPath), pageIndex, objectIndex,
+        jstringToUtf8(env, jReplacementText)));
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeApplyBatchEditsJson(
+    JNIEnv* env, jclass /* clazz */,
+    jstring jInputPath, jstring jOutputPath,
+    jstring jEditsJson) {
+    if (!jInputPath || !jOutputPath || !jEditsJson) {
+        return utf8ToJstring(env, jniErrorJson("INVALID_ARGUMENTS", "Input path, output path, and edits JSON must not be null"));
+    }
+    return utf8ToJstring(env, pie_engine::applyBatchEditsJson(
+        jstringToUtf8(env, jInputPath), jstringToUtf8(env, jOutputPath), jstringToUtf8(env, jEditsJson)));
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeApplyDocumentOperationsJson(
+    JNIEnv* env, jclass /* clazz */, jstring jInputPath, jstring jOutputPath, jstring jOpsJson) {
+    return utf8ToJstring(env, pie_engine::applyDocumentOperationsJson(
+        jstringToUtf8(env, jInputPath), jstringToUtf8(env, jOutputPath), jstringToUtf8(env, jOpsJson)));
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeMergeDocumentsJson(
+    JNIEnv* env, jclass /* clazz */, jstring jInputsJson, jstring jOutputPath) {
+    return utf8ToJstring(env, pie_engine::mergeDocumentsJson(jstringToUtf8(env, jInputsJson), jstringToUtf8(env, jOutputPath)));
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeCreatePdfFromImagesJson(
+    JNIEnv* env, jclass /* clazz */, jstring jSpecJson, jstring jOutputPath) {
+    return utf8ToJstring(env, pie_engine::createPdfFromImagesJson(jstringToUtf8(env, jSpecJson), jstringToUtf8(env, jOutputPath)));
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeSearchDocumentJson(
+    JNIEnv* env, jclass /* clazz */, jlong docHandle, jstring jQuery, jint maxResults) {
+    return utf8ToJstring(env, pie_engine::searchDocumentJson(docHandle, jstringToUtf8(env, jQuery), maxResults));
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeGetPageTextJson(
+    JNIEnv* env, jclass /* clazz */, jlong docHandle, jint pageIndex) {
+    return utf8ToJstring(env, pie_engine::pageTextJson(docHandle, pageIndex));
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_pdfimageeditor_pdf_NativePdfiumBridge_nativeGetPageCharsJson(
+    JNIEnv* env, jclass /* clazz */, jlong docHandle, jint pageIndex) {
+    return utf8ToJstring(env, pie_engine::pageCharsJson(docHandle, pageIndex));
 }
 
 } // extern "C"
+
+#endif  // __ANDROID__

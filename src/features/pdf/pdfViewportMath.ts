@@ -36,6 +36,26 @@ export function viewportPointToDocumentPoint(
 }
 
 /**
+ * Part of the page (document points, top-left origin) currently visible in a viewport of
+ * the given size, clamped to the page. Built only from viewportPointToDocumentPoint, so it
+ * uses exactly the same transform as hit-testing. Null when the page is not visible.
+ */
+export function visibleDocumentRect(
+  viewport: { width: number; height: number },
+  transform: PdfViewportTransform,
+  page: { width: number; height: number },
+): { x: number; y: number; width: number; height: number } | null {
+  const a = viewportPointToDocumentPoint({ x: 0, y: 0 }, transform);
+  const b = viewportPointToDocumentPoint({ x: viewport.width, y: viewport.height }, transform);
+  const left = Math.max(0, Math.min(a.x, b.x));
+  const top = Math.max(0, Math.min(a.y, b.y));
+  const right = Math.min(page.width, Math.max(a.x, b.x));
+  const bottom = Math.min(page.height, Math.max(a.y, b.y));
+  if (!(right > left) || !(bottom > top)) return null;
+  return { x: left, y: top, width: right - left, height: bottom - top };
+}
+
+/**
  * Converts a PDF document point into viewport space coordinates.
  * Centrally delegates to coordinates utility.
  */

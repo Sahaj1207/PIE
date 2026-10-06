@@ -1,7 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+  Only the two folders that hold copies prepared for sharing are exposed through the
+  FileProvider. Documents, working copies and settings in filesDir are never shareable.
+    exports/      edited images exported for Share (ImageProcessingModule.exportImagePage)
+    pdf_exports/  verified PDF copies for Share (NativePdfiumModule.sharePdf)
+-->
 <paths xmlns:android="http://schemas.android.com/apk/res/android">
-    <cache-path name="cache" path="." />
-    <files-path name="files" path="." />
-    <external-cache-path name="external_cache" path="." />
-    <external-files-path name="external_files" path="." />
+    <cache-path name="image_exports" path="exports/" />
+    <cache-path name="pdf_exports" path="pdf_exports/" />
 </paths>

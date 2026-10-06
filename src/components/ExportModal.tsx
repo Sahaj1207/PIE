@@ -1,22 +1,37 @@
-import React, { useState } from 'react';
-import {
-  Modal,
-  View,
-  Text,
-  TouchableOpacity,
-  StyleSheet,
-  ActivityIndicator,
-} from 'react-native';
+import React, { useEffect, useState } from 'react';
+import { StyleSheet, Text, View } from 'react-native';
 import { ExportFormat } from '../features/export/types';
-import { colors, radius, spacing, typography } from '../constants/theme';
+import { spacing, typography } from '../constants/theme';
+import { useTheme } from '../ui/ThemeProvider';
+import { BarButton, BottomSheet, ListRow, ListSection, PillButton, SegmentedControl } from '../ui/controls';
+import { useAppSettings } from '../settings/appSettings';
+
+/** User-chosen export action. */
+export type ExportAction = 'gallery' | 'share';
 
 interface ExportModalProps {
   visible: boolean;
   documentWidth: number;
   documentHeight: number;
   isExporting: boolean;
-  onExport: (format: ExportFormat, quality: number) => void;
+  /** True when the platform can publish exports to the photo library (Android 10+). */
+  galleryAvailable?: boolean;
+  onExport: (format: ExportFormat, quality: number, action: ExportAction) => void;
   onCancel: () => void;
+}
+
+const QUALITY_PRESETS: readonly { value: '85' | '92' | '98'; label: string }[] = [
+  { value: '85', label: 'Good' },
+  { value: '92', label: 'High' },
+  { value: '98', label: 'Maximum' },
+];
+
+/** Nearest JPEG preset for a 0.5–1.0 settings quality. */
+function presetFor(quality: number): '85' | '92' | '98' {
+  const pct = quality * 100;
+  if (pct >= 95) return '98';
+  if (pct >= 88) return '92';
+  return '85';
 }
 
 export const ExportModal: React.FC<ExportModalProps> = ({
@@ -24,339 +39,96 @@ export const ExportModal: React.FC<ExportModalProps> = ({
   documentWidth,
   documentHeight,
   isExporting,
+  galleryAvailable = false,
   onExport,
   onCancel,
 }) => {
-  const [selectedFormat, setSelectedFormat] = useState<ExportFormat>('png');
-  const [quality, setQuality] = useState<number>(95);
-  const theme = colors.light;
+  const { colors } = useTheme();
+  const settings = useAppSettings();
+  const [selectedFormat, setSelectedFormat] = useState<ExportFormat>(settings.defaultImageExportFormat);
+  const [quality, setQuality] = useState<'85' | '92' | '98'>(presetFor(settings.defaultImageExportQuality));
 
-  const handleConfirm = () => {
-    onExport(selectedFormat, quality);
+  // Every export starts from the defaults chosen in Settings
+  useEffect(() => {
+    if (visible) {
+      setSelectedFormat(settings.defaultImageExportFormat);
+      setQuality(presetFor(settings.defaultImageExportQuality));
+    }
+  }, [visible, settings.defaultImageExportFormat, settings.defaultImageExportQuality]);
+
+  const handleConfirm = (action: ExportAction) => {
+    onExport(selectedFormat, selectedFormat === 'png' ? 100 : Number(quality), action);
   };
 
+  const megapixels = (documentWidth * documentHeight) / 1_000_000;
+
   return (
-    <Modal
+    <BottomSheet
       visible={visible}
-      transparent
-      animationType="slide"
-      onRequestClose={onCancel}>
-      <View style={styles.overlay}>
-        <View style={[styles.modalCard, { backgroundColor: theme.surface }]}>
-          {/* Header */}
-          <View style={styles.header}>
-            <View>
-              <Text style={[styles.title, { color: theme.textPrimary }]}>
-                Export Image
-              </Text>
-              <Text style={[styles.subtitle, { color: theme.textSecondary }]}>
-                Save or share your edited image
-              </Text>
-            </View>
-            <TouchableOpacity
-              onPress={onCancel}
-              disabled={isExporting}
-              style={styles.closeButton}>
-              <Text style={[styles.closeIcon, { color: theme.textSecondary }]}>
-                ✕
-              </Text>
-            </TouchableOpacity>
+      onClose={() => {
+        if (!isExporting) onCancel();
+      }}
+      title="Export Image"
+      left={<BarButton label="Cancel" onPress={onCancel} disabled={isExporting} />}>
+      <View style={styles.body}>
+        <ListSection footer="Exports keep the original resolution. Your edits are composited on this device.">
+          <ListRow title="Size" value={`${documentWidth} × ${documentHeight}`} />
+          <ListRow title="Resolution" value={`${megapixels >= 10 ? megapixels.toFixed(0) : megapixels.toFixed(1)} MP`} />
+        </ListSection>
+
+        <View style={styles.group}>
+          <Text style={[styles.groupLabel, { color: colors.textSecondary }]}>FORMAT</Text>
+          <SegmentedControl
+            segments={[
+              { value: 'png', label: 'PNG' },
+              { value: 'jpeg', label: 'JPEG' },
+            ]}
+            value={selectedFormat}
+            onChange={setSelectedFormat}
+          />
+          <Text style={[styles.hint, { color: colors.textSecondary }]}>
+            {selectedFormat === 'png' ? 'Lossless — best for crisp text.' : 'Smaller files — best for photos.'}
+          </Text>
+        </View>
+
+        {selectedFormat === 'jpeg' && (
+          <View style={styles.group}>
+            <Text style={[styles.groupLabel, { color: colors.textSecondary }]}>QUALITY</Text>
+            <SegmentedControl segments={QUALITY_PRESETS} value={quality} onChange={setQuality} />
           </View>
+        )}
 
-          {/* Body */}
-          <View style={styles.body}>
-            {/* Dimensions Badge */}
-            <View style={[styles.resolutionCard, { backgroundColor: theme.background }]}>
-              <Text style={[styles.label, { color: theme.textSecondary }]}>
-                IMAGE RESOLUTION
-              </Text>
-              <Text style={[styles.resolutionValue, { color: theme.textPrimary }]}>
-                {documentWidth} × {documentHeight} px
-              </Text>
-              <Text style={[styles.resolutionSub, { color: theme.textSecondary }]}>
-                Full original quality
-              </Text>
-            </View>
-
-            {/* Format Selection */}
-            <View style={styles.section}>
-              <Text style={[styles.label, { color: theme.textSecondary }]}>
-                EXPORT FORMAT
-              </Text>
-              <View style={styles.formatRow}>
-                <TouchableOpacity
-                  activeOpacity={0.8}
-                  onPress={() => setSelectedFormat('png')}
-                  style={[
-                    styles.formatCard,
-                    { borderColor: theme.border },
-                    selectedFormat === 'png' && {
-                      borderColor: theme.primary,
-                      backgroundColor: theme.primarySubtle,
-                    },
-                  ]}>
-                  <Text
-                    style={[
-                      styles.formatTitle,
-                      {
-                        color:
-                          selectedFormat === 'png'
-                            ? theme.primary
-                            : theme.textPrimary,
-                      },
-                    ]}>
-                    PNG
-                  </Text>
-                  <Text style={[styles.formatDesc, { color: theme.textSecondary }]}>
-                    Lossless quality • Recommended for crisp text
-                  </Text>
-                </TouchableOpacity>
-
-                <TouchableOpacity
-                  activeOpacity={0.8}
-                  onPress={() => setSelectedFormat('jpeg')}
-                  style={[
-                    styles.formatCard,
-                    { borderColor: theme.border },
-                    selectedFormat === 'jpeg' && {
-                      borderColor: theme.primary,
-                      backgroundColor: theme.primarySubtle,
-                    },
-                  ]}>
-                  <Text
-                    style={[
-                      styles.formatTitle,
-                      {
-                        color:
-                          selectedFormat === 'jpeg'
-                            ? theme.primary
-                            : theme.textPrimary,
-                      },
-                    ]}>
-                    JPEG
-                  </Text>
-                  <Text style={[styles.formatDesc, { color: theme.textSecondary }]}>
-                    High quality • Compact file size
-                  </Text>
-                </TouchableOpacity>
-              </View>
-            </View>
-
-            {/* Quality Preset for JPEG */}
-            {selectedFormat === 'jpeg' && (
-              <View style={styles.section}>
-                <Text style={[styles.label, { color: theme.textSecondary }]}>
-                  JPEG QUALITY PRESET
-                </Text>
-                <View style={styles.presetRow}>
-                  {[85, 92, 98].map(q => (
-                    <TouchableOpacity
-                      key={q}
-                      activeOpacity={0.8}
-                      onPress={() => setQuality(q)}
-                      style={[
-                        styles.presetBtn,
-                        { borderColor: theme.border },
-                        quality === q && {
-                          borderColor: theme.primary,
-                          backgroundColor: theme.primarySubtle,
-                        },
-                      ]}>
-                      <Text
-                        style={[
-                          styles.presetText,
-                          {
-                            color:
-                              quality === q
-                                ? theme.primary
-                                : theme.textPrimary,
-                          },
-                        ]}>
-                        {q === 98 ? 'Max (98%)' : q === 92 ? 'High (92%)' : 'Good (85%)'}
-                      </Text>
-                    </TouchableOpacity>
-                  ))}
-                </View>
-              </View>
-            )}
-          </View>
-
-          {/* Footer */}
-          <View style={[styles.footer, { borderTopColor: theme.border }]}>
-            <TouchableOpacity
-              activeOpacity={0.7}
-              onPress={onCancel}
-              disabled={isExporting}
-              style={[styles.cancelBtn, { borderColor: theme.border }]}>
-              <Text style={[styles.cancelBtnText, { color: theme.textSecondary }]}>
-                Cancel
-              </Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              activeOpacity={0.8}
-              onPress={handleConfirm}
-              disabled={isExporting}
-              style={[
-                styles.confirmBtn,
-                { backgroundColor: theme.primary },
-                isExporting && styles.btnDisabled,
-              ]}>
-              {isExporting ? (
-                <View style={styles.exportingRow}>
-                  <ActivityIndicator size="small" color="#FFFFFF" />
-                  <Text style={styles.confirmBtnText}>Compositing...</Text>
-                </View>
-              ) : (
-                <Text style={styles.confirmBtnText}>Export & Share</Text>
-              )}
-            </TouchableOpacity>
-          </View>
+        <View style={styles.actions}>
+          {galleryAvailable && (
+            <PillButton
+              label={isExporting ? 'Exporting…' : 'Save to Photos'}
+              icon="download"
+              onPress={() => handleConfirm('gallery')}
+              loading={isExporting}
+              large
+              accessibilityLabel="Save exported image to Photos"
+            />
+          )}
+          <PillButton
+            label="Share…"
+            icon="share"
+            tone={galleryAvailable ? 'secondary' : 'primary'}
+            onPress={() => handleConfirm('share')}
+            disabled={isExporting}
+            loading={!galleryAvailable && isExporting}
+            large
+            accessibilityLabel="Share exported image"
+          />
         </View>
       </View>
-    </Modal>
+    </BottomSheet>
   );
 };
 
 const styles = StyleSheet.create({
-  overlay: {
-    flex: 1,
-    backgroundColor: 'rgba(0, 0, 0, 0.45)',
-    justifyContent: 'flex-end',
-  },
-  modalCard: {
-    borderTopLeftRadius: radius.lg,
-    borderTopRightRadius: radius.lg,
-    paddingBottom: spacing.lg,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: -3 },
-    shadowOpacity: 0.15,
-    shadowRadius: 8,
-    elevation: 10,
-  },
-  header: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingHorizontal: spacing.lg,
-    paddingTop: spacing.lg,
-    paddingBottom: spacing.md,
-  },
-  title: {
-    ...typography.titleMedium,
-    fontWeight: '700',
-  },
-  subtitle: {
-    ...typography.caption,
-    marginTop: 2,
-  },
-  closeButton: {
-    padding: spacing.xs,
-  },
-  closeIcon: {
-    fontSize: 18,
-    fontWeight: '600',
-  },
-  body: {
-    paddingHorizontal: spacing.lg,
-    gap: spacing.md,
-  },
-  resolutionCard: {
-    padding: spacing.md,
-    borderRadius: radius.md,
-    gap: 2,
-  },
-  label: {
-    ...typography.caption,
-    fontWeight: '700',
-    letterSpacing: 0.5,
-  },
-  resolutionValue: {
-    ...typography.titleMedium,
-    fontWeight: '700',
-    marginVertical: 2,
-  },
-  resolutionSub: {
-    ...typography.caption,
-  },
-  section: {
-    gap: spacing.xs,
-  },
-  formatRow: {
-    flexDirection: 'row',
-    gap: spacing.sm,
-  },
-  formatCard: {
-    flex: 1,
-    borderWidth: 1.5,
-    borderRadius: radius.md,
-    padding: spacing.md,
-    gap: 4,
-  },
-  formatTitle: {
-    ...typography.bodyMedium,
-    fontWeight: '700',
-  },
-  formatDesc: {
-    ...typography.caption,
-    fontSize: 11,
-  },
-  presetRow: {
-    flexDirection: 'row',
-    gap: spacing.sm,
-  },
-  presetBtn: {
-    flex: 1,
-    borderWidth: 1,
-    borderRadius: radius.sm,
-    paddingVertical: spacing.sm,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  presetText: {
-    ...typography.caption,
-    fontWeight: '600',
-  },
-  footer: {
-    flexDirection: 'row',
-    justifyContent: 'flex-end',
-    gap: spacing.sm,
-    paddingHorizontal: spacing.lg,
-    paddingTop: spacing.md,
-    marginTop: spacing.md,
-    borderTopWidth: StyleSheet.hairlineWidth,
-  },
-  cancelBtn: {
-    paddingHorizontal: spacing.lg,
-    paddingVertical: spacing.sm + 4,
-    borderRadius: radius.md,
-    borderWidth: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  cancelBtnText: {
-    ...typography.bodyMedium,
-    fontWeight: '600',
-  },
-  confirmBtn: {
-    paddingHorizontal: spacing.lg,
-    paddingVertical: spacing.sm + 4,
-    borderRadius: radius.md,
-    alignItems: 'center',
-    justifyContent: 'center',
-    minWidth: 150,
-  },
-  confirmBtnText: {
-    ...typography.bodyMedium,
-    color: '#FFFFFF',
-    fontWeight: '700',
-  },
-  btnDisabled: {
-    opacity: 0.6,
-  },
-  exportingRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: spacing.sm,
-  },
+  body: { paddingTop: spacing.sm },
+  group: { paddingHorizontal: spacing.lg, marginBottom: spacing.lg, gap: 6 },
+  groupLabel: { ...typography.sectionHeader, marginLeft: spacing.lg },
+  hint: { ...typography.caption, marginLeft: spacing.lg },
+  actions: { paddingHorizontal: spacing.lg, gap: spacing.sm, marginTop: spacing.xs },
 });

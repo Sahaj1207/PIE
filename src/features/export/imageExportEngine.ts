@@ -1,7 +1,12 @@
 import { NativeModules } from 'react-native';
 import { Document } from '../../types/document';
-import { ExportError } from '../../errors';
-import { fitTextToBoundingBox } from '../text/textFitting';
+import { ExportError, ImageExportUnavailableError } from '../../errors';
+import { buildImageRenderPlan } from '../image/imageRenderPlan';
+import { defaultTextMeasurer } from '../image/textMeasurement';
+import { TextMeasurer } from '../text/textLayout';
+
+// `process` is not guaranteed by the React Native type config (see HomeScreen).
+declare const process: any;
 import {
   ExportFormat,
   ExportOptions,
@@ -9,8 +14,27 @@ import {
   IExportEngine,
 } from './types';
 
+/** Upper bound of decoded pixels the native exporter accepts before refusing (OOM guard). */
+export const MAX_EXPORT_PIXELS = 50_000_000;
+
+/** Simulated native results are only permitted inside the Jest test environment. */
+function isTestEnvironment(): boolean {
+  return process.env.NODE_ENV === 'test';
+}
+
+function sanitizeDisplayName(name?: string): string {
+  const base = (name || 'PIE_Export')
+    .replace(/\.[A-Za-z0-9]+$/, '')
+    .replace(/[^A-Za-z0-9._-]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+  return base.length > 0 ? base.substring(0, 80) : 'PIE_Export';
+}
+
 export class ImageExportEngine implements IExportEngine {
   private isExporting: boolean = false;
+
+  /** @param measureText text measurer for the render plan; must match the canvas's. */
+  constructor(private readonly measureText: TextMeasurer = defaultTextMeasurer) {}
 
   async exportDocument(
     document: Document,
@@ -38,6 +62,7 @@ export class ImageExportEngine implements IExportEngine {
     const pageIndex = safeOptions.pageIndices?.[0] ?? 0;
     const page = document.pages[pageIndex] || document.pages[0];
 
+    // Always export from the full-resolution working image, never the display preview.
     const sourceImageUri = page.originalContent.assetUri;
     if (!sourceImageUri) {
       throw new ExportError('Source image asset URI is missing');
@@ -57,62 +82,33 @@ export class ImageExportEngine implements IExportEngine {
         ? 100
         : 95;
 
+    const destination = safeOptions.destination === 'gallery' ? 'gallery' : 'file';
+    const displayName = sanitizeDisplayName(safeOptions.displayName || document.metadata.title);
+
     this.isExporting = true;
     try {
-      // 1. Collect reconstructed background patches for both modified and deleted regions
-      const patches = page.editableTextRegions
-        .filter(r => (r.status === 'modified' || r.status === 'deleted') && !!r.reconstructedPatchUri)
-        .map(r => ({
-          patchUri: r.reconstructedPatchUri!,
-          bounds: r.reconstructedPatchBounds || r.bounds,
-        }));
+      // Same composition plan the on-screen canvas renders (WYSIWYG export), built with the
+      // same text measurer, so line breaks and line positions are identical.
+      const plan = buildImageRenderPlan(page, { measureText: this.measureText });
 
-      // 2. Collect replacement text elements with fitted typography (modified regions only)
-      const replacementElements = page.editableTextRegions
-        .filter(r => r.status === 'modified' && !!r.currentText && r.currentText.trim().length > 0)
-        .map(r => {
-          const fit = fitTextToBoundingBox(
-            r.bounds,
-            r.originalText,
-            r.currentText,
-            r.style,
-          );
+      const patches = plan.patches.map((p) => ({
+        patchUri: p.patchUri,
+        bounds: p.bounds,
+      }));
 
-          return {
-            text: r.currentText,
-            bounds: r.bounds,
-            fittedFontSize: fit.fittedFontSize,
-            baselineY: fit.baselineY,
-            color: r.style.color || '#111827',
-            fontWeight: r.style.fontWeight || 'normal',
-            fontFamily: r.style.fontFamily || 'sans-serif',
-          };
-        });
-
-      // 3. Collect newly added text elements
-      const addedElements = (page.addedText || [])
-        .filter(a => !!a.text && a.text.trim().length > 0)
-        .map(a => {
-          const bounds = a.bounds || {
-            x: (a as any).x || 0,
-            y: (a as any).y || 0,
-            width: (a as any).width || 0,
-            height: (a as any).height || 0,
-          };
-          const fontSize = a.style?.fontSize || 14;
-          return {
-            text: a.text,
-            bounds,
-            fittedFontSize: fontSize,
-            baselineY: bounds.y + fontSize * 0.85,
-            color: a.style?.color || '#111827',
-            fontWeight: a.style?.fontWeight || 'normal',
-            fontFamily: a.style?.fontFamily || 'sans-serif',
-          };
-        });
-
-      // Combine all text elements; UI selection overlays are strictly excluded
-      const textElements = [...replacementElements, ...addedElements];
+      const textElements = plan.textElements.map((t) => ({
+        text: t.text,
+        bounds: t.bounds,
+        fittedFontSize: t.fittedFontSize,
+        baselineY: t.baselineY,
+        drawX: t.drawX,
+        color: t.color,
+        fontWeight: t.fontWeight,
+        fontStyle: t.fontStyle,
+        fontFamily: t.fontFamily,
+        // Lines exactly as planned (document coordinates); the exporter draws them as-is.
+        lines: t.lines.map((l) => ({ text: l.text, x: l.x, baselineY: l.baselineY })),
+      }));
 
       const imageProcessingModule = NativeModules.ImageProcessingModule;
       if (imageProcessingModule && imageProcessingModule.exportImagePage) {
@@ -123,12 +119,26 @@ export class ImageExportEngine implements IExportEngine {
             quality,
             patches,
             textElements,
+            drawings: plan.drawings.map((d) => ({
+              commands: d.commands,
+              color: d.color,
+              width: d.width,
+              opacity: d.opacity,
+              multiply: d.multiply,
+            })),
+            destination,
+            displayName,
+            maxPixels: MAX_EXPORT_PIXELS,
           });
 
           return {
             destinationUri: result.destinationUri,
             format: result.format === 'png' ? 'png' : 'jpeg',
             fileSizeBytes: result.fileSizeBytes,
+            galleryUri: typeof result.galleryUri === 'string' ? result.galleryUri : undefined,
+            savedToGallery: result.savedToGallery === true,
+            width: typeof result.width === 'number' ? result.width : undefined,
+            height: typeof result.height === 'number' ? result.height : undefined,
           };
         } catch (err: unknown) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -136,11 +146,18 @@ export class ImageExportEngine implements IExportEngine {
         }
       }
 
-      // Fallback for non-native / Jest test environments
+      if (!isTestEnvironment()) {
+        throw new ImageExportUnavailableError(
+          'Image export is not available on this platform: the native image exporter is not linked.',
+        );
+      }
+
+      // Simulated result for the Jest test environment only.
       return {
         destinationUri: `file:///simulated/exports/export_${Date.now()}.${format === 'png' ? 'png' : 'jpg'}`,
         format: format === 'png' ? 'png' : 'jpeg',
         fileSizeBytes: 1048576, // 1MB simulated size
+        savedToGallery: false,
       };
     } finally {
       this.isExporting = false;
@@ -173,6 +190,11 @@ export class ImageExportEngine implements IExportEngine {
       }
     }
 
+    if (!isTestEnvironment()) {
+      throw new ImageExportUnavailableError(
+        'Sharing is not available on this platform: the native share bridge is not linked.',
+      );
+    }
     return true;
   }
 }

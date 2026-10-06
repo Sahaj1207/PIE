@@ -233,6 +233,8 @@ export interface PdfReplaceCommand {
   readonly originalText?: string;
   readonly newText: string;
   readonly format?: PdfTextFormatOptions;
+  /** Shift the text that follows on the same line by the width change (native reflow). */
+  readonly reflow?: boolean;
 }
 
 export interface PdfDeleteCommand {
@@ -242,6 +244,8 @@ export interface PdfDeleteCommand {
   readonly objectIndex: number;
   readonly objectPath?: readonly number[];
   readonly originalText?: string;
+  /** Close up the line after removing the object (native reflow). */
+  readonly reflow?: boolean;
 }
 
 export interface PdfInsertCommand {
@@ -277,6 +281,29 @@ export interface PdfCommandResult {
   readonly fontStrategy?: string;
   readonly error?: string;
   readonly unsupportedFormatting?: readonly string[];
+  /**
+   * Native reopen check of THIS edit: the edited object holds exactly the requested text and
+   * exact occurrence counts on the page match (duplicate-safe), or the deleted text occurs
+   * one fewer time than before.
+   */
+  readonly verifiedInReopened?: boolean;
+  /** Native reason when verifiedInReopened is false. */
+  readonly verificationError?: string;
+}
+
+/** Result of a successful Save As to a user-chosen location. */
+export interface PdfUserLocationCopy {
+  /** content:// URI of the written document (owned by the chosen provider). */
+  readonly uri: string;
+  readonly displayName: string;
+  readonly sizeBytes: number;
+}
+
+/** Result of handing a PDF to the system share sheet. */
+export interface PdfShareResult {
+  /** FileProvider content:// URI that was shared (never a filesystem path). */
+  readonly contentUri: string;
+  readonly displayName: string;
 }
 
 export interface PdfMultiEditVerification {
@@ -323,7 +350,35 @@ export type PdfEditorHistoryAction =
       readonly newText: string;
       readonly newFormat?: PdfTextFormatOptions;
       readonly previousPendingCommand?: PdfTextEditCommand;
-    };
+    }
+  | PdfRevisionHistoryAction;
+
+/**
+ * Snapshot of the pending-command model folded into an applied revision, so undoing the
+ * revision restores exactly the queued (not yet applied) state that existed before it.
+ */
+export interface PdfPendingStateSnapshot {
+  readonly pendingEdits: readonly PdfTextEditCommand[];
+  readonly deletedObjectIds: readonly string[];
+  readonly insertedObjects: readonly PdfTextObject[];
+  readonly undoActions: readonly PdfEditorHistoryAction[];
+}
+
+/**
+ * An edit applied natively to a new working-copy file (working-copy model).
+ * Undo reopens `beforePath`; redo reopens `afterPath`. Both files are immutable once
+ * written, so undo/redo reverse the actual PDF content rather than only in-memory state.
+ */
+export interface PdfRevisionHistoryAction {
+  readonly type: 'revision';
+  /** Text edits, page tools ('pages') or markup drawn on a page ('markup'). */
+  readonly operation: 'replace' | 'delete' | 'insert' | 'pages' | 'markup';
+  readonly objectId: string;
+  readonly pageIndex: number;
+  readonly beforePath: string;
+  readonly afterPath: string;
+  readonly foldedPending?: PdfPendingStateSnapshot;
+}
 
 export interface IPdfDocumentEditor {
   open(filePath: string): Promise<void>;
@@ -366,8 +421,13 @@ export interface IPdfDocumentEditor {
   getPendingEdits(): readonly PdfTextEditCommand[];
   canUndo(): boolean;
   canRedo(): boolean;
-  undo(): void;
-  redo(): void;
+  /**
+   * Undo/redo are asynchronous because reversing an applied (working-copy) edit reopens a
+   * different PDF revision. Reversing a queued edit completes synchronously before the
+   * returned promise is created.
+   */
+  undo(): Promise<void>;
+  redo(): Promise<void>;
   clearHistory(): void;
   saveEdits(outputPath: string): Promise<PdfMultiEditResult>;
   saveDocument(outputPath?: string): Promise<{
@@ -400,20 +460,56 @@ export interface PdfFontDetails {
   readonly flags: number | null;
 }
 
+/**
+ * Affine map from PDF user space (points, origin at the box's lower-left, Y up) to the
+ * DISPLAYED page (points, origin top-left, Y down) exactly as PDFium renders it, i.e. with
+ * the page's /Rotate and crop-box origin applied. u = a*x + c*y + e, v = b*x + d*y + f.
+ */
+export interface PdfDisplayMatrix {
+  readonly a: number;
+  readonly b: number;
+  readonly c: number;
+  readonly d: number;
+  readonly e: number;
+  readonly f: number;
+}
+
+export type PdfPageRotation = 0 | 90 | 180 | 270;
+
 export interface PdfPageSize {
   readonly pageIndex: number;
+  /** Displayed (rendered) width in points (rotation already applied). */
   readonly width: number;
+  /** Displayed (rendered) height in points (rotation already applied). */
   readonly height: number;
+  /** Page /Rotate (clockwise) when known; absent = 0. */
+  readonly rotation?: PdfPageRotation;
+  /** User -> display mapping from PDFium when known; absent = unrotated, origin (0,0). */
+  readonly displayMatrix?: PdfDisplayMatrix;
 }
 
 export interface PdfDocumentHandle {
   readonly docHandle: number;
   readonly pageCount: number;
   readonly filePath: string;
+  /** Size of the opened file when the platform reports it (revision storage cap). */
+  readonly fileSizeBytes?: number;
 }
 
 export interface PdfRenderOptions {
   readonly scale?: number;
+}
+
+/** A display-space region of a page rendered at high resolution (zoom detail). */
+export interface PdfRenderedRegion {
+  readonly filePath: string;
+  readonly uri: string;
+  readonly width: number;
+  readonly height: number;
+  readonly scale: number;
+  readonly pageIndex: number;
+  /** Region in display points (top-left origin). */
+  readonly rect: { readonly x: number; readonly y: number; readonly width: number; readonly height: number };
 }
 
 export interface PdfRenderedPage {
@@ -438,12 +534,54 @@ export interface IPdfiumEngine {
     options?: PdfRenderOptions,
   ): Promise<PdfRenderedPage>;
   getTextObjects(docHandle: number, pageIndex: number): Promise<PdfTextObject[]>;
+  /** Renders a display-space region of a page at `scale` px/pt (zoom detail). */
+  renderPageRegion?(
+    docHandle: number,
+    pageIndex: number,
+    scale: number,
+    rect: { x: number; y: number; width: number; height: number },
+  ): Promise<PdfRenderedRegion>;
   extractAssetPdf(assetName: string): Promise<string>;
   pickPdfDocument?(): Promise<{ filePath: string; fileName: string; fileSize: number } | null>;
   replaceTextObject(
     request: PdfTextReplacementRequest,
   ): Promise<PdfTextReplacementResult>;
+  /**
+   * Applies a NON-EMPTY batch of edit commands. An empty `commands` array is rejected;
+   * writing an unchanged document is the separate copyDocument() operation.
+   */
   applyBatchEdits(request: PdfBatchEditRequest): Promise<PdfMultiEditResult>;
+  /**
+   * Writes a verified copy of `inputPdfPath` to `outputPdfPath` (no edit commands).
+   * Used by Save when all edits are already applied to the working copy.
+   * Required: Save never falls back to an empty applyBatchEdits() batch.
+   */
+  copyDocument(inputPdfPath: string, outputPdfPath: string): Promise<PdfMultiEditResult>;
+  /** Atomically moves `fromPath` over `toPath` (used to finish a save onto the open file). */
+  replaceFile?(fromPath: string, toPath: string): Promise<void>;
+  /** Deletes cached page renders except the given file paths. */
+  purgeRenderCache?(keepFilePaths: readonly string[]): Promise<number>;
+  /** Deletes obsolete picker/content-URI import copies except the given file paths. */
+  purgeImportCache?(keepFilePaths?: readonly string[]): Promise<number>;
+  /**
+   * Save As: the user picks filename + destination (Android ACTION_CREATE_DOCUMENT); the
+   * verified app-private PDF at `sourcePath` is copied there and read back for
+   * verification. Resolves null when the user cancels.
+   */
+  saveCopyToUserLocation?(sourcePath: string, suggestedFileName: string): Promise<PdfUserLocationCopy | null>;
+  /** Shares the verified app-private PDF through the system share sheet (content:// URI). */
+  sharePdfFile?(sourcePath: string, displayName: string, chooserTitle: string): Promise<PdfShareResult>;
+  /** Deletes share copies older than maxAgeMs (0 = all). */
+  purgeExportCache?(maxAgeMs?: number): Promise<number>;
+  /**
+   * Page tools / markup (pie_pdf_ops): applies `operations` from `inputPdfPath` into the NEW
+   * file `outputPdfPath`, verified by reopening. The input is never modified.
+   */
+  applyDocumentOperations?(
+    inputPdfPath: string,
+    outputPdfPath: string,
+    operations: readonly import('./pdfDocumentOperations').PdfDocumentOperation[],
+  ): Promise<import('./pdfDocumentOperations').PdfDocumentOperationsResult>;
   createEditor(filePath?: string): IPdfDocumentEditor;
 }
 

@@ -19,6 +19,7 @@ import {
   ocrResultToTextRegions,
 } from './normalization';
 import { defaultOcrCache } from './ocrCache';
+import { alignRegionsToDocument, nativeOcrOptions } from './ocrPreprocessing';
 
 export class OnDeviceOcrEngine implements IOcrEngine {
   private getNativeModule() {
@@ -86,7 +87,14 @@ export class OnDeviceOcrEngine implements IOcrEngine {
     }
 
     try {
-      const rawResult: RawNativeOcrResult = await nativeMod.recognizeText(assetUri);
+      const size = options?.imageSize;
+      // Deterministic on-device preprocessing (orientation, alpha flattening, bounded
+      // resampling) when the native module supports it; boxes come back in the original
+      // upright pixel grid.
+      const rawResult: RawNativeOcrResult =
+        size && typeof nativeMod.recognizeTextWithOptions === 'function'
+          ? await nativeMod.recognizeTextWithOptions(assetUri, nativeOcrOptions(size.width, size.height))
+          : await nativeMod.recognizeText(assetUri);
       return normalizeRawNativeOcrResult(rawResult);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
@@ -100,7 +108,11 @@ export class OnDeviceOcrEngine implements IOcrEngine {
     options?: OcrProcessingOptions,
   ): Promise<TextRegion[]> {
     const ocrResult = await this.recognizeText(assetUri, options);
-    return ocrResultToTextRegions(ocrResult, pageIndex);
+    const regions = ocrResultToTextRegions(ocrResult, pageIndex);
+    // Regions must be in DOCUMENT coordinates even if the OCR pixel grid differs
+    return options?.imageSize
+      ? alignRegionsToDocument(regions, ocrResult.imageDimensions, options.imageSize)
+      : regions;
   }
 }
 

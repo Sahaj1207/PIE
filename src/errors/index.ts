@@ -63,7 +63,24 @@ export type AppErrorCode =
   | 'IMAGE_UNSUPPORTED_FONT'
   | 'IMAGE_TEXT_OVERFLOW'
   | 'IMAGE_STALE_SELECTION'
-  | 'IMAGE_PATCH_FAILED';
+  | 'IMAGE_PATCH_FAILED'
+  | 'IMAGE_TOO_LARGE'
+  | 'IMAGE_SAVE_FAILED'
+  | 'IMAGE_EXPORT_UNAVAILABLE'
+  | 'IMAGE_RECONSTRUCTION_UNAVAILABLE'
+  | 'PDF_SECURITY_UNSUPPORTED'
+  | 'PDF_UNSUPPORTED_GLYPHS'
+  | 'PDF_SHARE_FAILED'
+  | 'PDF_OUTPUT_UNAVAILABLE'
+  | 'PDF_OUTPUT_NOT_VERIFIED'
+  | 'DOCUMENT_BUSY'
+  | 'DOCUMENT_STORAGE_FAILED'
+  | 'DOCUMENT_STORAGE_CORRUPTED'
+  | 'DOCUMENT_ASSET_MISSING'
+  | 'PDF_DOCUMENT_OPERATION_FAILED'
+  | 'PDF_MERGE_FAILED'
+  | 'PDF_CREATE_FAILED'
+  | 'IMAGE_TRANSFORM_FAILED';
 
 export abstract class AppError extends Error {
   abstract readonly code: AppErrorCode;
@@ -173,6 +190,21 @@ export class PdfFontLimitationError extends PdfTextReplacementError {
   readonly code: AppErrorCode = 'PDF_TEXT_REPLACEMENT_FAILED';
 }
 
+/**
+ * The requested text contains characters the PDF font cannot draw (missing glyphs, CJK in
+ * a Latin font, emoji, control characters). The edit is refused instead of producing
+ * missing or silently substituted glyphs. `characters` lists the offending characters.
+ */
+export class PdfUnsupportedGlyphsError extends PdfFontLimitationError {
+  readonly code: AppErrorCode = 'PDF_UNSUPPORTED_GLYPHS';
+  readonly characters: readonly string[];
+
+  constructor(message: string, characters: readonly string[] = [], cause?: unknown) {
+    super(message, cause);
+    this.characters = characters;
+  }
+}
+
 export class PdfInvalidObjectPathError extends PdfInvalidObjectIdError {
   readonly code: AppErrorCode = 'PDF_INVALID_OBJECT_ID';
 }
@@ -249,6 +281,26 @@ export class PdfSourceUnavailableError extends PdfFileNotFoundError {
 
 export class PdfWorkingCopyError extends PdfBatchEditError {
   readonly code: AppErrorCode = 'PDF_WORKING_COPY_FAILED';
+}
+
+/** The PDF uses an encryption/security handler PDFium cannot open. Never bypassed. */
+export class PdfSecurityUnsupportedError extends AppError {
+  readonly code: AppErrorCode = 'PDF_SECURITY_UNSUPPORTED';
+}
+
+/** Sharing a verified PDF through the system share sheet failed. */
+export class PdfShareError extends AppError {
+  readonly code: AppErrorCode = 'PDF_SHARE_FAILED';
+}
+
+/** Save As / Share are not available on this platform (native output bridge missing). */
+export class PdfOutputUnavailableError extends AppError {
+  readonly code: AppErrorCode = 'PDF_OUTPUT_UNAVAILABLE';
+}
+
+/** Save As / Share refused: there is no saved, reopen-verified PDF to expose. */
+export class PdfOutputNotVerifiedError extends AppError {
+  readonly code: AppErrorCode = 'PDF_OUTPUT_NOT_VERIFIED';
 }
 
 export class PdfSaveAsError extends PdfSaveError {
@@ -361,4 +413,62 @@ export class ImageStaleSelectionError extends AppError {
 
 export class ImagePatchFailedError extends AppError {
   readonly code: AppErrorCode = 'IMAGE_PATCH_FAILED';
+}
+
+/** Image exceeds the on-device pixel budget for safe decoding, editing and export. */
+export class ImageTooLargeError extends ImageInvalidDimensionsError {
+  readonly code: AppErrorCode = 'IMAGE_TOO_LARGE';
+}
+
+export class ImageSaveError extends AppError {
+  readonly code: AppErrorCode = 'IMAGE_SAVE_FAILED';
+}
+
+/** Native export pipeline is not linked on this platform (never simulated outside tests). */
+export class ImageExportUnavailableError extends ExportError {
+  readonly code: AppErrorCode = 'IMAGE_EXPORT_UNAVAILABLE';
+}
+
+/**
+ * Native background reconstruction is not linked on this platform. Never replaced by a
+ * simulated patch outside tests: an edit must not report success without real pixels.
+ */
+export class ImageReconstructionUnavailableError extends BackgroundReconstructionError {
+  readonly code: AppErrorCode = 'IMAGE_RECONSTRUCTION_UNAVAILABLE';
+}
+
+export class DocumentStorageError extends AppError {
+  readonly code: AppErrorCode = 'DOCUMENT_STORAGE_FAILED';
+}
+
+/** The document is open, saving or otherwise in use and cannot be deleted right now. */
+export class DocumentBusyError extends DocumentStorageError {
+  readonly code: AppErrorCode = 'DOCUMENT_BUSY';
+}
+
+export class DocumentStorageCorruptedError extends DocumentStorageError {
+  readonly code: AppErrorCode = 'DOCUMENT_STORAGE_CORRUPTED';
+}
+
+export class DocumentAssetMissingError extends DocumentStorageError {
+  readonly code: AppErrorCode = 'DOCUMENT_ASSET_MISSING';
+}
+
+/** A page tool / markup operation (rotate, delete, move, insert, ink, shapes...) failed. */
+export class PdfDocumentOperationError extends AppError {
+  readonly code: AppErrorCode = 'PDF_DOCUMENT_OPERATION_FAILED';
+}
+
+export class PdfMergeError extends AppError {
+  readonly code: AppErrorCode = 'PDF_MERGE_FAILED';
+}
+
+/** Creating a new PDF (from images) failed. */
+export class PdfCreateError extends AppError {
+  readonly code: AppErrorCode = 'PDF_CREATE_FAILED';
+}
+
+/** Rotating / flipping / cropping an image document failed. */
+export class ImageTransformError extends AppError {
+  readonly code: AppErrorCode = 'IMAGE_TRANSFORM_FAILED';
 }

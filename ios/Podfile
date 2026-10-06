@@ -17,6 +17,10 @@ end
 target 'PdfAndImageEditor' do
   config = use_native_modules!
 
+  # PIE native modules (PDFium engine shared with Android, file store, OCR, image tools).
+  # Run scripts/fetch-pdfium-ios.sh once before `pod install`.
+  pod 'PieNative', :path => '..'
+
   use_react_native!(
     :path => config[:reactNativePath],
     # An absolute path to your application root.

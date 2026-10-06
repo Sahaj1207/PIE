@@ -18,10 +18,12 @@ class MainApplication : Application(), ReactApplication {
           add(com.pdfimageeditor.ocr.OcrPackage())
           // Native project-owned image background reconstruction package
           add(com.pdfimageeditor.image.ImageProcessingPackage())
-          // Native project-owned PDF spike package (sample PDF preparation & inspection)
-          add(com.pdfimageeditor.pdf.PdfSpikePackage())
           // Native project-owned PDFium engine package
           add(com.pdfimageeditor.pdf.NativePdfiumPackage())
+          // Native project-owned durable document file store (app-private, offline)
+          add(com.pdfimageeditor.storage.PieFileStorePackage())
+          // Native project-owned app services (haptics, clipboard, storage usage)
+          add(com.pdfimageeditor.app.PieAppPackage())
         },
     )
   }

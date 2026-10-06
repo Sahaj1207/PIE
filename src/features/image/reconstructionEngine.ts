@@ -1,6 +1,9 @@
 import { NativeModules } from 'react-native';
 import { DocumentRect } from '../../types/geometry';
-import { BackgroundReconstructionError } from '../../errors';
+import {
+  BackgroundReconstructionError,
+  ImageReconstructionUnavailableError,
+} from '../../errors';
 import {
   IBackgroundReconstructionEngine,
   ReconstructedPatchResult,
@@ -8,12 +11,61 @@ import {
 
 const { ImageProcessingModule } = NativeModules;
 
+// Same local declaration as HomeScreen: `process` is not guaranteed by the RN type config.
+declare const process: any;
+
+function isTestEnvironment(): boolean {
+  return process.env.NODE_ENV === 'test';
+}
+
+/**
+ * Validates a native reconstruction result. A patch without a file or with empty bounds
+ * would let an edit "succeed" without replacing any pixels, so it is rejected.
+ */
+function toVerifiedPatchResult(result: any): ReconstructedPatchResult {
+  const patchUri = typeof result?.patchUri === 'string' ? result.patchUri.trim() : '';
+  const b = result?.bounds;
+  const bounds = {
+    x: Number(b?.x),
+    y: Number(b?.y),
+    width: Number(b?.width),
+    height: Number(b?.height),
+  };
+  if (!patchUri) {
+    throw new BackgroundReconstructionError(
+      'Native background reconstruction returned no patch image.',
+    );
+  }
+  if (
+    !Number.isFinite(bounds.x) ||
+    !Number.isFinite(bounds.y) ||
+    !(bounds.width > 0) ||
+    !(bounds.height > 0)
+  ) {
+    throw new BackgroundReconstructionError(
+      'Native background reconstruction returned invalid patch bounds.',
+    );
+  }
+  return {
+    patchUri,
+    bounds,
+    estimatedBackgroundColor: result.estimatedBackgroundColor,
+    estimatedTextColor: result.estimatedTextColor,
+    confidence: result.confidence ?? 0.9,
+  };
+}
+
 export class LocalBackgroundReconstructionEngine
   implements IBackgroundReconstructionEngine
 {
+  /**
+   * @param options.outputDir Optional app-private directory for the generated patch PNG.
+   *   When omitted the native default (cache) is used, preserving prior behavior.
+   */
   async reconstructBackground(
     imageUri: string,
     region: DocumentRect,
+    options?: { readonly outputDir?: string | null },
   ): Promise<ReconstructedPatchResult> {
     if (!imageUri) {
       throw new BackgroundReconstructionError(
@@ -30,27 +82,28 @@ export class LocalBackgroundReconstructionEngine
     const imageProcessingModule = NativeModules.ImageProcessingModule;
     if (imageProcessingModule && imageProcessingModule.reconstructBackground) {
       try {
-        const result = await imageProcessingModule.reconstructBackground(
-          imageUri,
-          region.x,
-          region.y,
-          region.width,
-          region.height,
-        );
+        const outputDir = options?.outputDir;
+        const result =
+          outputDir && typeof imageProcessingModule.reconstructBackgroundToDirectory === 'function'
+            ? await imageProcessingModule.reconstructBackgroundToDirectory(
+                imageUri,
+                region.x,
+                region.y,
+                region.width,
+                region.height,
+                outputDir,
+              )
+            : await imageProcessingModule.reconstructBackground(
+                imageUri,
+                region.x,
+                region.y,
+                region.width,
+                region.height,
+              );
 
-        return {
-          patchUri: result.patchUri,
-          bounds: {
-            x: result.bounds.x,
-            y: result.bounds.y,
-            width: result.bounds.width,
-            height: result.bounds.height,
-          },
-          estimatedBackgroundColor: result.estimatedBackgroundColor,
-          estimatedTextColor: result.estimatedTextColor,
-          confidence: result.confidence ?? 0.9,
-        };
+        return toVerifiedPatchResult(result);
       } catch (err: unknown) {
+        if (err instanceof BackgroundReconstructionError) throw err;
         const msg = err instanceof Error ? err.message : String(err);
         throw new BackgroundReconstructionError(
           `Native background reconstruction failed: ${msg}`,
@@ -59,7 +112,13 @@ export class LocalBackgroundReconstructionEngine
       }
     }
 
-    // Fallback for non-native environments (Jest unit tests or mock runs)
+    if (!isTestEnvironment()) {
+      throw new ImageReconstructionUnavailableError(
+        'Background reconstruction is not available on this platform: the native image processor is not linked.',
+      );
+    }
+
+    // Simulated result for the Jest test environment only (never in the app).
     return {
       patchUri: '',
       bounds: {

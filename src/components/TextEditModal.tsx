@@ -1,29 +1,37 @@
 import React, { useState, useEffect } from 'react';
+import { Platform, Pressable, StyleSheet, Text, TextInput } from 'react-native';
+import { AddedTextElement, TextRegion } from '../types/document';
+import { platformFontFamily, resolveRenderableFontFamily } from '../features/text/textLayout';
+import { fontWeights, radius, spacing, typography } from '../constants/theme';
+import { useTheme } from '../ui/ThemeProvider';
 import {
-  Modal,
-  View,
-  Text,
-  TextInput,
-  TouchableOpacity,
-  StyleSheet,
-  ActivityIndicator,
-  KeyboardAvoidingView,
-  Platform,
-  ScrollView,
-} from 'react-native';
-import { TextRegion } from '../types/document';
-import { colors, spacing } from '../constants/theme';
+  ChoiceSegments,
+  ColorSwatches,
+  EditorSheet,
+  FormatGroup,
+  FormatNote,
+  FormatRow,
+  SizeStepper,
+  ToggleButton,
+} from '../ui/formatControls';
 
-const PRESET_SIZES = [12, 14, 16, 20, 24, 32];
-const COLOR_SWATCHES = [
-  '#000000',
-  '#007AFF',
-  '#34C759',
-  '#FF3B30',
-  '#FF9500',
-  '#8E8E93',
-  '#FFFFFF',
-];
+const PRESET_SIZES = [10, 12, 14, 16, 20, 24, 32, 48];
+/** On-screen size (points) of newly added text. */
+const DEFAULT_INSERT_SIZE_PT = 18;
+const MIN_SIZE_PT = 4;
+const MAX_SIZE_PT = 400;
+
+/**
+ * Document pixels per on-screen point at the image's fit zoom. Font sizes are stored in
+ * DOCUMENT pixels; showing and stepping them in on-screen points keeps sizes meaningful for
+ * every image resolution (an 18 px font is ~2 pt on screen for a 12 MP photo at fit).
+ */
+export function documentPixelsPerPoint(fitScale: number | null | undefined): number {
+  if (!fitScale || !Number.isFinite(fitScale) || fitScale <= 0) return 1;
+  return Math.min(64, Math.max(0.25, 1 / fitScale));
+}
+
+export const IMAGE_TEXT_COLORS = ['#000000', '#3A3A3C', '#8E8E93', '#FFFFFF', '#007AFF', '#34C759', '#FF3B30', '#FF9500', '#AF52DE'];
 
 export interface TextEditModalConfirmStyle {
   fontFamily?: string;
@@ -31,11 +39,40 @@ export interface TextEditModalConfirmStyle {
   fontWeight?: string;
   fontStyle?: 'normal' | 'italic';
   color?: string;
+  /** Only offered for added text (OCR replacements keep their fitted single line). */
+  alignment?: 'left' | 'center' | 'right';
+}
+
+type Family = 'sans-serif' | 'serif' | 'monospace';
+type Alignment = 'left' | 'center' | 'right';
+
+const FAMILIES: readonly { value: Family; label: string; fontFamily: string }[] = [
+  { value: 'sans-serif', label: 'Sans', fontFamily: platformFontFamily('sans-serif', Platform.OS) },
+  { value: 'serif', label: 'Serif', fontFamily: platformFontFamily('serif', Platform.OS) },
+  { value: 'monospace', label: 'Mono', fontFamily: platformFontFamily('monospace', Platform.OS) },
+];
+
+const ALIGNMENTS: readonly { value: Alignment; icon: 'alignLeft' | 'alignCenter' | 'alignRight'; accessibilityLabel: string }[] = [
+  { value: 'left', icon: 'alignLeft', accessibilityLabel: 'Align Left' },
+  { value: 'center', icon: 'alignCenter', accessibilityLabel: 'Align Center' },
+  { value: 'right', icon: 'alignRight', accessibilityLabel: 'Align Right' },
+];
+
+function toFamily(value: string | undefined): Family {
+  const resolved = resolveRenderableFontFamily(value);
+  return resolved === 'serif' || resolved === 'monospace' ? resolved : 'sans-serif';
 }
 
 interface TextEditModalProps {
+  /**
+   * Document pixels per displayed point (see documentPixelsPerPoint). Sizes are shown and
+   * stepped in points; the confirmed fontSize is in document pixels. Default 1.
+   */
+  fontScale?: number;
   visible: boolean;
   region?: TextRegion | null;
+  /** Added-text layer being edited (prefills text and formatting). */
+  addedText?: AddedTextElement | null;
   initialText?: string;
   initialStyle?: any;
   isInsertMode?: boolean;
@@ -48,6 +85,8 @@ interface TextEditModalProps {
 export const TextEditModal: React.FC<TextEditModalProps> = ({
   visible,
   region,
+  addedText = null,
+  fontScale = 1,
   isInsertMode = false,
   isProcessing,
   onConfirm,
@@ -55,500 +94,149 @@ export const TextEditModal: React.FC<TextEditModalProps> = ({
   onCancel,
 }) => {
   const [editText, setEditText] = useState('');
-  const [fontFamily, setFontFamily] = useState('sans-serif');
+  const [fontFamily, setFontFamily] = useState<Family>('sans-serif');
   const [fontSize, setFontSize] = useState(16);
   const [isBold, setIsBold] = useState(false);
   const [isItalic, setIsItalic] = useState(false);
   const [textColor, setTextColor] = useState('#000000');
-  const theme = colors.light;
+  const [alignment, setAlignment] = useState<Alignment>('left');
+  const { colors } = useTheme();
+  const isAddedTextMode = isInsertMode || !!addedText;
+  const isRegionMode = !isAddedTextMode && !!region;
 
   useEffect(() => {
-    if (region && !isInsertMode) {
+    if (addedText && !isInsertMode) {
+      setEditText(addedText.text);
+      setFontFamily(toFamily(addedText.style.fontFamily));
+      setFontSize(addedText.style.fontSize || DEFAULT_INSERT_SIZE_PT * fontScale);
+      setIsBold(addedText.style.fontWeight === 'bold' || addedText.style.fontWeight === '700');
+      setIsItalic(addedText.style.fontStyle === 'italic');
+      setTextColor(addedText.style.color || '#000000');
+      const a = addedText.style.alignment;
+      setAlignment(a === 'center' || a === 'right' ? a : 'left');
+    } else if (region && !isInsertMode) {
       setEditText(region.currentText || region.originalText || '');
-      setFontFamily(region.style.fontFamily || 'sans-serif');
-      setFontSize(Math.round(region.style.fontSize) || 16);
+      setFontFamily(toFamily(region.style.fontFamily));
+      setFontSize(region.style.fontSize || 16 * fontScale);
       setIsBold(region.style.fontWeight === 'bold' || region.style.fontWeight === '700');
       setIsItalic(region.style.fontStyle === 'italic');
       setTextColor(region.style.color || '#000000');
     } else if (isInsertMode) {
       setEditText('');
       setFontFamily('sans-serif');
-      setFontSize(18);
+      setFontSize(DEFAULT_INSERT_SIZE_PT * fontScale);
       setIsBold(false);
       setIsItalic(false);
       setTextColor('#000000');
+      setAlignment('left');
     }
-  }, [region, isInsertMode, visible]);
+  }, [region, addedText, isInsertMode, visible, fontScale]);
 
-  if (!visible) return null;
+  // fontSize is kept in DOCUMENT pixels (exact when untouched); shown / stepped in points
+  const sizePt = Math.round(fontSize / fontScale);
+  const setSizePt = (pt: number) => setFontSize(Math.min(MAX_SIZE_PT, Math.max(MIN_SIZE_PT, pt)) * fontScale);
 
   const handleConfirm = () => {
     if (!editText.trim()) return;
+    // Only leading/trailing blank space is removed; inner newlines are kept as lines.
     onConfirm(editText.trim(), {
       fontFamily,
       fontSize,
       fontWeight: isBold ? 'bold' : 'normal',
       fontStyle: isItalic ? 'italic' : 'normal',
       color: textColor,
+      ...(isAddedTextMode ? { alignment } : {}),
     });
   };
 
-  const title = isInsertMode ? 'Add Text' : 'Edit Text';
-  const subtitle = isInsertMode
-    ? 'Enter text to add to this image'
-    : 'Edit the selected text and choose formatting';
+  const swatches = IMAGE_TEXT_COLORS.some((c) => c.toUpperCase() === textColor.toUpperCase())
+    ? IMAGE_TEXT_COLORS
+    : [textColor.toUpperCase(), ...IMAGE_TEXT_COLORS];
 
   return (
-    <Modal
+    <EditorSheet
       visible={visible}
-      transparent
-      animationType="slide"
-      onRequestClose={onCancel}>
-      <KeyboardAvoidingView
-        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-        style={styles.modalOverlay}>
-        <TouchableOpacity
-          style={styles.backdrop}
-          activeOpacity={1}
-          onPress={onCancel}
-        />
+      title={isInsertMode ? 'Add Text' : 'Edit Text'}
+      confirmLabel={isInsertMode ? 'Add' : 'Done'}
+      confirmDisabled={!editText.trim()}
+      confirmLoading={isProcessing}
+      onConfirm={handleConfirm}
+      onCancel={onCancel}>
+      <TextInput
+        value={editText}
+        onChangeText={setEditText}
+        style={[
+          styles.textInput,
+          {
+            backgroundColor: colors.cell,
+            color: colors.textPrimary,
+            fontFamily: platformFontFamily(fontFamily, Platform.OS),
+            fontWeight: isBold ? '700' : '400',
+            fontStyle: isItalic ? 'italic' : 'normal',
+            textAlign: isAddedTextMode ? alignment : 'left',
+          },
+        ]}
+        placeholder={isInsertMode ? 'Type your text' : 'Replacement text'}
+        placeholderTextColor={colors.textMuted}
+        multiline
+        autoFocus
+        selectTextOnFocus={!isInsertMode}
+        accessibilityLabel="Text"
+      />
 
-        <View style={styles.sheetContainer}>
-          {/* iOS Grabber */}
-          <View style={styles.grabberContainer}>
-            <View style={styles.grabber} />
-          </View>
+      {isRegionMode && (
+        <FormatNote icon="scanText">
+          The original text is removed and the background behind it is rebuilt on this device.
+        </FormatNote>
+      )}
 
-          {/* Header */}
-          <View style={styles.sheetHeader}>
-            <View style={styles.headerTitles}>
-              <Text style={styles.sheetTitle}>{title}</Text>
-              <Text style={styles.sheetSubtitle}>{subtitle}</Text>
-            </View>
-            <TouchableOpacity
-              onPress={onCancel}
-              style={styles.closeBtn}
-              accessibilityLabel="Close dialog">
-              <Text style={styles.closeBtnText}>✕</Text>
-            </TouchableOpacity>
-          </View>
+      <FormatGroup>
+        <FormatRow label="Font">
+          <ChoiceSegments options={FAMILIES} value={fontFamily} onChange={setFontFamily} />
+          <ToggleButton icon="bold" label="Bold" active={isBold} onToggle={() => setIsBold((b) => !b)} />
+          <ToggleButton icon="italic" label="Italic" active={isItalic} onToggle={() => setIsItalic((i) => !i)} />
+        </FormatRow>
+        <FormatRow label="Size">
+          <SizeStepper value={sizePt} onChange={setSizePt} min={MIN_SIZE_PT} max={MAX_SIZE_PT} presets={PRESET_SIZES} />
+        </FormatRow>
+        {isAddedTextMode && (
+          <FormatRow label="Align">
+            <ChoiceSegments options={ALIGNMENTS} value={alignment} onChange={setAlignment} style={styles.alignSegments} />
+          </FormatRow>
+        )}
+        <FormatRow label="Colour">
+          <ColorSwatches colors={swatches} value={textColor} onChange={setTextColor} accessibilityPrefix="Text colour" />
+        </FormatRow>
+      </FormatGroup>
 
-          <ScrollView style={styles.sheetBody} showsVerticalScrollIndicator={false}>
-            {/* Text Input */}
-            <Text style={styles.sectionLabel}>Text</Text>
-            <TextInput
-              value={editText}
-              onChangeText={setEditText}
-              style={styles.textInput}
-              placeholder={isInsertMode ? 'Enter text here...' : 'Enter replacement text...'}
-              placeholderTextColor={theme.textMuted}
-              multiline
-              autoFocus
-              selectTextOnFocus={!isInsertMode}
-            />
-
-            {/* Font Family Segmented Control */}
-            <Text style={styles.sectionLabel}>Font</Text>
-            <View style={styles.segmentGroup}>
-              <TouchableOpacity
-                onPress={() => setFontFamily('sans-serif')}
-                style={[styles.segmentBtn, fontFamily === 'sans-serif' && styles.segmentBtnActive]}>
-                <Text style={[styles.segmentText, fontFamily === 'sans-serif' && styles.segmentTextActive]}>
-                  System
-                </Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                onPress={() => setFontFamily('serif')}
-                style={[styles.segmentBtn, fontFamily === 'serif' && styles.segmentBtnActive]}>
-                <Text style={[styles.segmentText, fontFamily === 'serif' && styles.segmentTextActive, { fontFamily: 'serif' }]}>
-                  Serif
-                </Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                onPress={() => setFontFamily('monospace')}
-                style={[styles.segmentBtn, fontFamily === 'monospace' && styles.segmentBtnActive]}>
-                <Text style={[styles.segmentText, fontFamily === 'monospace' && styles.segmentTextActive, { fontFamily: 'monospace' }]}>
-                  Mono
-                </Text>
-              </TouchableOpacity>
-            </View>
-
-            {/* Style & Size Row */}
-            <View style={styles.row}>
-              {/* Style Buttons */}
-              <View style={styles.flexHalf}>
-                <Text style={styles.sectionLabel}>Style</Text>
-                <View style={styles.styleGroup}>
-                  <TouchableOpacity
-                    onPress={() => setIsBold(!isBold)}
-                    style={[styles.styleBtn, isBold && styles.styleBtnActive]}>
-                    <Text style={[styles.styleBtnText, isBold && styles.styleBtnTextActive, { fontWeight: '700' }]}>
-                      B
-                    </Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity
-                    onPress={() => setIsItalic(!isItalic)}
-                    style={[styles.styleBtn, isItalic && styles.styleBtnActive]}>
-                    <Text style={[styles.styleBtnText, isItalic && styles.styleBtnTextActive, { fontStyle: 'italic' }]}>
-                      I
-                    </Text>
-                  </TouchableOpacity>
-                </View>
-              </View>
-
-              {/* Font Size Stepper */}
-              <View style={styles.flexHalf}>
-                <Text style={styles.sectionLabel}>Size ({fontSize} pt)</Text>
-                <View style={styles.stepperContainer}>
-                  <TouchableOpacity
-                    onPress={() => setFontSize(Math.max(8, fontSize - 2))}
-                    style={styles.stepBtn}>
-                    <Text style={styles.stepBtnText}>−</Text>
-                  </TouchableOpacity>
-                  <Text style={styles.currentSizeText}>{fontSize}</Text>
-                  <TouchableOpacity
-                    onPress={() => setFontSize(Math.min(72, fontSize + 2))}
-                    style={styles.stepBtn}>
-                    <Text style={styles.stepBtnText}>+</Text>
-                  </TouchableOpacity>
-                </View>
-              </View>
-            </View>
-
-            {/* Size Presets */}
-            <View style={styles.presetRow}>
-              {PRESET_SIZES.map((sz) => (
-                <TouchableOpacity
-                  key={sz}
-                  onPress={() => setFontSize(sz)}
-                  style={[styles.presetBtn, fontSize === sz && styles.presetBtnActive]}>
-                  <Text style={[styles.presetBtnText, fontSize === sz && styles.presetBtnTextActive]}>
-                    {sz}
-                  </Text>
-                </TouchableOpacity>
-              ))}
-            </View>
-
-            {/* Color Swatches */}
-            <Text style={styles.sectionLabel}>Color</Text>
-            <View style={styles.swatchRow}>
-              {COLOR_SWATCHES.map((hex) => (
-                <TouchableOpacity
-                  key={hex}
-                  onPress={() => setTextColor(hex)}
-                  style={[
-                    styles.swatch,
-                    { backgroundColor: hex },
-                    textColor === hex && styles.swatchActive,
-                  ]}>
-                  {textColor === hex && (
-                    <Text style={[styles.swatchCheck, { color: hex === '#FFFFFF' ? '#000000' : '#FFFFFF' }]}>
-                      ✓
-                    </Text>
-                  )}
-                </TouchableOpacity>
-              ))}
-            </View>
-          </ScrollView>
-
-          {/* Action Buttons */}
-          <View style={styles.actionRow}>
-            {!isInsertMode && onDelete && (
-              <TouchableOpacity
-                onPress={onDelete}
-                disabled={isProcessing}
-                style={styles.deleteBtn}>
-                <Text style={styles.deleteBtnText}>Delete</Text>
-              </TouchableOpacity>
-            )}
-            <TouchableOpacity onPress={onCancel} style={styles.cancelBtn}>
-              <Text style={styles.cancelBtnText}>Cancel</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              onPress={handleConfirm}
-              disabled={isProcessing || !editText.trim()}
-              style={[styles.doneBtn, (isProcessing || !editText.trim()) && styles.doneBtnDisabled]}>
-              {isProcessing ? (
-                <ActivityIndicator size="small" color="#FFFFFF" />
-              ) : (
-                <Text style={styles.doneBtnText}>
-                  {isInsertMode ? 'Add Text' : 'Done'}
-                </Text>
-              )}
-            </TouchableOpacity>
-          </View>
-        </View>
-      </KeyboardAvoidingView>
-    </Modal>
+      {!isInsertMode && onDelete && (
+        <Pressable
+          onPress={onDelete}
+          disabled={isProcessing}
+          accessibilityRole="button"
+          accessibilityLabel="Delete text"
+          style={({ pressed }) => [styles.deleteRow, { backgroundColor: pressed ? colors.cellPressed : colors.cell }, isProcessing && styles.dim]}>
+          <Text style={[styles.deleteText, { color: colors.danger }]}>Delete Text</Text>
+        </Pressable>
+      )}
+    </EditorSheet>
   );
 };
 
 const styles = StyleSheet.create({
-  modalOverlay: {
-    flex: 1,
-    backgroundColor: 'rgba(0, 0, 0, 0.45)',
-    justifyContent: 'flex-end',
-  },
-  backdrop: {
-    flex: 1,
-  },
-  sheetContainer: {
-    backgroundColor: '#FFFFFF',
-    borderTopLeftRadius: 20,
-    borderTopRightRadius: 20,
-    paddingHorizontal: spacing.lg,
-    paddingBottom: spacing.xxl,
-    maxHeight: '85%',
-    shadowColor: '#000000',
-    shadowOpacity: 0.15,
-    shadowOffset: { width: 0, height: -4 },
-    shadowRadius: 16,
-    elevation: 10,
-  },
-  grabberContainer: {
-    alignItems: 'center',
-    paddingVertical: spacing.sm,
-  },
-  grabber: {
-    width: 36,
-    height: 5,
-    borderRadius: 2.5,
-    backgroundColor: '#D1D1D6',
-  },
-  sheetHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingBottom: spacing.md,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: '#E5E5EA',
-  },
-  headerTitles: {
-    flex: 1,
-  },
-  sheetTitle: {
-    fontSize: 17,
-    fontWeight: '600',
-    color: '#000000',
-  },
-  sheetSubtitle: {
-    fontSize: 13,
-    color: '#8E8E93',
-    marginTop: 2,
-  },
-  closeBtn: {
-    padding: spacing.xs,
-    marginLeft: spacing.sm,
-  },
-  closeBtnText: {
-    fontSize: 15,
-    fontWeight: '500',
-    color: '#8E8E93',
-  },
-  sheetBody: {
-    paddingVertical: spacing.md,
-  },
-  sectionLabel: {
-    fontSize: 13,
-    fontWeight: '600',
-    color: '#3C3C43',
-    marginBottom: spacing.xs,
-    marginTop: spacing.xs,
-  },
   textInput: {
-    backgroundColor: '#F2F2F7',
-    borderRadius: 10,
-    color: '#000000',
-    fontSize: 16,
-    padding: 12,
-    minHeight: 52,
-    marginBottom: spacing.sm,
+    minHeight: 64,
+    maxHeight: 150,
+    borderRadius: radius.md,
+    paddingHorizontal: spacing.md,
+    paddingTop: 10,
+    paddingBottom: 10,
+    ...typography.bodyLarge,
+    lineHeight: undefined,
+    textAlignVertical: 'top',
   },
-  segmentGroup: {
-    flexDirection: 'row',
-    backgroundColor: '#E5E5EA',
-    borderRadius: 8,
-    padding: 2,
-    marginBottom: spacing.sm,
-  },
-  segmentBtn: {
-    flex: 1,
-    paddingVertical: 7,
-    borderRadius: 7,
-    alignItems: 'center',
-  },
-  segmentBtnActive: {
-    backgroundColor: '#FFFFFF',
-    shadowColor: '#000000',
-    shadowOpacity: 0.1,
-    shadowOffset: { width: 0, height: 1 },
-    shadowRadius: 2,
-    elevation: 2,
-  },
-  segmentText: {
-    fontSize: 13,
-    fontWeight: '500',
-    color: '#3C3C43',
-  },
-  segmentTextActive: {
-    color: '#000000',
-    fontWeight: '600',
-  },
-  row: {
-    flexDirection: 'row',
-    gap: spacing.md,
-    marginBottom: spacing.xs,
-  },
-  flexHalf: {
-    flex: 1,
-  },
-  styleGroup: {
-    flexDirection: 'row',
-    gap: spacing.xs,
-  },
-  styleBtn: {
-    flex: 1,
-    height: 38,
-    borderRadius: 8,
-    backgroundColor: '#F2F2F7',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  styleBtnActive: {
-    backgroundColor: '#007AFF',
-  },
-  styleBtnText: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: '#3C3C43',
-  },
-  styleBtnTextActive: {
-    color: '#FFFFFF',
-  },
-  stepperContainer: {
-    flexDirection: 'row',
-    height: 38,
-    backgroundColor: '#F2F2F7',
-    borderRadius: 8,
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingHorizontal: 6,
-  },
-  stepBtn: {
-    width: 28,
-    height: 28,
-    borderRadius: 6,
-    backgroundColor: '#FFFFFF',
-    alignItems: 'center',
-    justifyContent: 'center',
-    shadowColor: '#000000',
-    shadowOpacity: 0.08,
-    shadowOffset: { width: 0, height: 1 },
-    shadowRadius: 1,
-    elevation: 1,
-  },
-  stepBtnText: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: '#000000',
-  },
-  currentSizeText: {
-    fontSize: 14,
-    fontWeight: '600',
-    color: '#000000',
-  },
-  presetRow: {
-    flexDirection: 'row',
-    gap: 6,
-    marginVertical: spacing.xs,
-  },
-  presetBtn: {
-    paddingHorizontal: 9,
-    paddingVertical: 4,
-    borderRadius: 6,
-    backgroundColor: '#F2F2F7',
-  },
-  presetBtnActive: {
-    backgroundColor: '#007AFF',
-  },
-  presetBtnText: {
-    fontSize: 12,
-    fontWeight: '500',
-    color: '#3C3C43',
-  },
-  presetBtnTextActive: {
-    color: '#FFFFFF',
-    fontWeight: '600',
-  },
-  swatchRow: {
-    flexDirection: 'row',
-    gap: 12,
-    marginTop: spacing.xs,
-    marginBottom: spacing.md,
-  },
-  swatch: {
-    width: 32,
-    height: 32,
-    borderRadius: 16,
-    alignItems: 'center',
-    justifyContent: 'center',
-    shadowColor: '#000000',
-    shadowOpacity: 0.15,
-    shadowOffset: { width: 0, height: 1 },
-    shadowRadius: 2,
-    elevation: 2,
-  },
-  swatchActive: {
-    borderWidth: 2,
-    borderColor: '#007AFF',
-    transform: [{ scale: 1.15 }],
-  },
-  swatchCheck: {
-    fontSize: 13,
-    fontWeight: '900',
-  },
-  actionRow: {
-    flexDirection: 'row',
-    gap: spacing.md,
-    paddingTop: spacing.sm,
-  },
-  deleteBtn: {
-    paddingVertical: 12,
-    paddingHorizontal: spacing.lg,
-    borderRadius: 10,
-    backgroundColor: '#FEE2E2',
-    alignItems: 'center',
-  },
-  deleteBtnText: {
-    fontSize: 15,
-    fontWeight: '600',
-    color: '#DC2626',
-  },
-  cancelBtn: {
-    flex: 1,
-    paddingVertical: 12,
-    borderRadius: 10,
-    backgroundColor: '#F2F2F7',
-    alignItems: 'center',
-  },
-  cancelBtnText: {
-    fontSize: 15,
-    fontWeight: '600',
-    color: '#3C3C43',
-  },
-  doneBtn: {
-    flex: 1,
-    paddingVertical: 12,
-    borderRadius: 10,
-    backgroundColor: '#007AFF',
-    alignItems: 'center',
-  },
-  doneBtnDisabled: {
-    opacity: 0.4,
-  },
-  doneBtnText: {
-    fontSize: 15,
-    fontWeight: '600',
-    color: '#FFFFFF',
-  },
+  alignSegments: { flex: 0, width: 132 },
+  deleteRow: { minHeight: 44, borderRadius: radius.md, alignItems: 'center', justifyContent: 'center' },
+  deleteText: { ...typography.bodyLarge, fontWeight: fontWeights.regular },
+  dim: { opacity: 0.4 },
 });

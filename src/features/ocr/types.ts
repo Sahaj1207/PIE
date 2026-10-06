@@ -111,6 +111,11 @@ export interface OcrProcessingOptions {
   readonly languageHints?: string[];
   /** Minimum confidence threshold between 0.0 and 1.0 */
   readonly confidenceThreshold?: number;
+  /**
+   * Upright pixel size of the image (the document's dimensions). Enables deterministic
+   * preprocessing (see ocrPreprocessing.ts) and maps results into document coordinates.
+   */
+  readonly imageSize?: { readonly width: number; readonly height: number };
 }
 
 export interface IOcrEngine {

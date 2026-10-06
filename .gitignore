@@ -87,3 +87,18 @@ scratch/
 # Local IDE / tooling
 .vscode/
 .idea/
+
+# Generated React Native JS bundle. Debug loads JS from Metro; release bundles are generated
+# by the React Native Gradle plugin under android/app/build. A checked-in copy would shadow
+# the current JS, so it must never be committed.
+android/app/src/main/assets/index.android.bundle
+android/app/src/main/assets/index.android.bundle.map
+
+# Release signing secrets
+android/keystore.properties
+*.jks
+
+# iOS PDFium binary (fetched by scripts/fetch-pdfium-ios.sh)
+ios/PieNative/Vendor/pdfium.xcframework/
+/assets/index.android.bundle
+/assets/index.android.bundle.map

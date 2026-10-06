@@ -172,6 +172,11 @@ describe('Phase 5 - PDF Existing-Text Formatting & Layout Fidelity', () => {
     async replaceTextObject(): Promise<any> {
       throw new Error('Not used in Phase 5');
     }
+    // Verified copy (Save with no queued commands). Test double only: emulates the native
+    // copy through this mock's batch implementation so failure injection still applies.
+    async copyDocument(inputPdfPath: string, outputPdfPath: string): Promise<PdfMultiEditResult> {
+      return this.applyBatchEdits({ inputPdfPath, outputPdfPath, commands: [] });
+    }
     async applyBatchEdits(request: PdfBatchEditRequest): Promise<PdfMultiEditResult> {
       this.applyBatchEditsCalls.push(request);
       if (this.shouldFailApply) {

@@ -3,12 +3,15 @@ import { RouteProp } from '@react-navigation/native';
 
 export type RootStackParamList = {
   Home: undefined;
+  Settings: undefined;
   Editor: {
     documentId?: string;
   };
   PdfEditor: {
     pdfPath?: string;
     fileName?: string;
+    /** Existing persisted PDF record to update on save (reopened from Home). */
+    documentId?: string;
   } | undefined;
 };
 
@@ -33,3 +36,5 @@ export type PdfEditorScreenRouteProp = RouteProp<
   RootStackParamList,
   'PdfEditor'
 >;
+
+export type SettingsScreenNavigationProp = NativeStackNavigationProp<RootStackParamList, 'Settings'>;

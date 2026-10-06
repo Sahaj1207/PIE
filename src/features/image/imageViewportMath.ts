@@ -111,6 +111,34 @@ export function calculateImageInitialFit(params: ImageInitialFitParams): Viewpor
   };
 }
 
+export interface ImageZoomBounds {
+  readonly minScale: number;
+  readonly maxScale: number;
+}
+
+/** Lowest zoom allowed relative to the fit-to-viewport scale (zooming out past fit). */
+export const IMAGE_MIN_ZOOM_OUT_OF_FIT = 0.5;
+
+/**
+ * Resolves absolute zoom bounds for an image whose fit-to-viewport scale is `fitScale`.
+ *
+ * Large images fit at scales far below MIN_IMAGE_SCALE (e.g. 0.1 for a 4000 px photo).
+ * Clamping such a transform to the fixed [0.5, 4.0] range made the first pinch jump the
+ * image to 0.5. The minimum therefore extends down to half the fit scale, while the
+ * maximum keeps the established 4.0 upper bound (never below the fit scale itself).
+ */
+export function resolveImageZoomBounds(fitScale: number): ImageZoomBounds {
+  if (!isFinite(fitScale) || fitScale <= 0) {
+    return { minScale: MIN_IMAGE_SCALE, maxScale: MAX_IMAGE_SCALE };
+  }
+  const minScale = Math.min(MIN_IMAGE_SCALE, fitScale * IMAGE_MIN_ZOOM_OUT_OF_FIT);
+  const maxScale = Math.max(MAX_IMAGE_SCALE, fitScale);
+  return {
+    minScale: Math.round(minScale * 10000) / 10000,
+    maxScale,
+  };
+}
+
 /**
  * Calculates new transform (scale and focal translation) preserving the point under fingers.
  * Clamps scale strictly to [minScale, maxScale] (default 0.5 to 4.0).

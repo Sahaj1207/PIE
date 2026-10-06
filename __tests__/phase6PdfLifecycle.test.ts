@@ -111,6 +111,12 @@ describe('Phase 6 - PDF Document Lifecycle & Final Save/Export Hardening', () =>
       throw new Error('Not used in Phase 6');
     }
 
+    // Verified copy (Save with no queued commands). Test double only: emulates the native
+    // copy through this mock's batch implementation so failure injection still applies.
+    async copyDocument(inputPdfPath: string, outputPdfPath: string): Promise<PdfMultiEditResult> {
+      return this.applyBatchEdits({ inputPdfPath, outputPdfPath, commands: [] });
+    }
+
     async applyBatchEdits(request: PdfBatchEditRequest): Promise<PdfMultiEditResult> {
       this.applyBatchEditsCalls.push(request);
 

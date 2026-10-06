@@ -1,16 +1,108 @@
 import { Image, NativeModules } from 'react-native';
-import { launchImageLibrary } from 'react-native-image-picker';
+import { launchCamera, launchImageLibrary } from 'react-native-image-picker';
 import { Document, DocumentPage } from '../../types/document';
 import {
   ImageCancelledError,
+  ImageDecodeError,
   ImageInvalidDimensionsError,
+  ImageTooLargeError,
   ImageUnsupportedFormatError,
   ImageUriUnsupportedError,
+  ImageWorkingCopyError,
   UnsupportedDocumentError,
 } from '../../errors';
 import { documentStorage } from '../../storage';
+import { getDocumentDirectory, DOCUMENT_ASSETS_DIR } from '../../storage/documentFiles';
+import { joinPath } from '../../storage/nativeFileStore';
 import { ImageDocumentModel } from './types';
 import { ImageDocumentSession } from './imageDocumentSession';
+
+import { MAX_IMAGE_PIXELS, PREVIEW_MAX_DIMENSION } from './imageLimits';
+
+export { MAX_IMAGE_PIXELS, PREVIEW_MAX_DIMENSION };
+
+/** Result of the native durable import (EXIF-normalized working copy + preview). */
+export interface NativeImageImportResult {
+  readonly workingUri: string;
+  readonly previewUri?: string;
+  readonly width: number;
+  readonly height: number;
+  readonly mimeType?: string;
+  readonly exifOrientation?: number;
+  readonly fileSizeBytes?: number;
+}
+
+/** Throws ImageTooLargeError when dimensions exceed the on-device pixel budget. */
+export function assertImageWithinPixelBudget(
+  width: number,
+  height: number,
+  maxPixels: number = MAX_IMAGE_PIXELS,
+): void {
+  if (width > 0 && height > 0 && width * height > maxPixels) {
+    throw new ImageTooLargeError(
+      `Image is too large to edit on this device (${width}x${height}, ${(
+        (width * height) /
+        1_000_000
+      ).toFixed(1)} MP). The maximum supported size is ${(maxPixels / 1_000_000).toFixed(0)} MP.`,
+    );
+  }
+}
+
+/**
+ * Imports the picked image into durable app storage via the native module:
+ * copies the source (never modifying it), applies EXIF orientation so the working copy is
+ * stored upright, enforces the pixel budget and generates a display preview.
+ * Returns null when the native durable import is unavailable on this platform.
+ */
+export async function importImageIntoDocumentStorage(
+  sourceUri: string,
+  documentId: string,
+): Promise<NativeImageImportResult | null> {
+  const native = NativeModules.ImageProcessingModule;
+  if (!native || typeof native.importImageDocument !== 'function') {
+    return null;
+  }
+  const docDir = await getDocumentDirectory(documentId);
+  if (!docDir) {
+    return null;
+  }
+
+  let res: any;
+  try {
+    res = await native.importImageDocument(
+      sourceUri,
+      joinPath(docDir, DOCUMENT_ASSETS_DIR),
+      MAX_IMAGE_PIXELS,
+      PREVIEW_MAX_DIMENSION,
+    );
+  } catch (err: unknown) {
+    const code = (err as { code?: string })?.code;
+    const msg = err instanceof Error ? err.message : String(err);
+    if (code === 'IMAGE_TOO_LARGE') {
+      throw new ImageTooLargeError(msg, err);
+    }
+    if (code === 'IMAGE_DECODE_FAILED') {
+      throw new ImageDecodeError(msg, err);
+    }
+    throw new ImageWorkingCopyError(`Failed to import image into document storage: ${msg}`, err);
+  }
+
+  const width = Number(res?.width || 0);
+  const height = Number(res?.height || 0);
+  if (!res?.workingUri || width <= 0 || height <= 0) {
+    throw new ImageWorkingCopyError('Native image import returned an invalid result.');
+  }
+
+  return {
+    workingUri: String(res.workingUri),
+    previewUri: res.previewUri ? String(res.previewUri) : undefined,
+    width,
+    height,
+    mimeType: res.mimeType ? String(res.mimeType) : undefined,
+    exifOrientation: Number(res.exifOrientation || 1),
+    fileSizeBytes: res.fileSizeBytes ? Number(res.fileSizeBytes) : undefined,
+  };
+}
 
 export interface PickedImageResult {
   readonly uri: string;
@@ -209,6 +301,62 @@ export async function pickImageFromLibrary(): Promise<PickedImageResult | null> 
 }
 
 /**
+ * Takes a photo with the system camera (no camera permission is requested by the app; the
+ * system camera app captures the photo). Returns null when cancelled.
+ */
+export async function takePhotoWithCamera(): Promise<PickedImageResult | null> {
+  const response = await launchCamera({
+    mediaType: 'photo',
+    includeBase64: false,
+    saveToPhotos: false,
+    cameraType: 'back',
+  });
+  if (response.didCancel || !response.assets || response.assets.length === 0) {
+    if (response.errorCode && response.errorCode !== 'camera_unavailable') {
+      throw new UnsupportedDocumentError(response.errorMessage || 'The camera could not be opened.');
+    }
+    if (response.errorCode === 'camera_unavailable') {
+      throw new UnsupportedDocumentError('No camera is available on this device.');
+    }
+    return null;
+  }
+  const asset = response.assets[0];
+  if (!asset.uri) {
+    throw new UnsupportedDocumentError('The photo does not have a valid file URI.');
+  }
+  const resolvedUri = await resolveImageFileUri(asset.uri);
+  let width = asset.width;
+  let height = asset.height;
+  if (!width || !height || width <= 0 || height <= 0) {
+    const dims = await getImageDimensions(resolvedUri).catch(() => ({ width: 1200, height: 1600 }));
+    width = dims.width;
+    height = dims.height;
+  }
+  const stamp = new Date();
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return {
+    uri: resolvedUri,
+    width,
+    height,
+    fileName: `Photo ${stamp.getFullYear()}-${pad(stamp.getMonth() + 1)}-${pad(stamp.getDate())} ${pad(stamp.getHours())}.${pad(stamp.getMinutes())}.jpg`,
+    fileSizeBytes: asset.fileSize,
+    mimeType: asset.type || 'image/jpeg',
+    orientation: 1,
+  };
+}
+
+/** Picks several photos (images -> PDF). Returns their URIs in selection order. */
+export async function pickImagesFromLibrary(limit = 50): Promise<string[]> {
+  const response = await launchImageLibrary({
+    mediaType: 'photo',
+    selectionLimit: limit,
+    includeBase64: false,
+  });
+  if (response.didCancel || !response.assets) return [];
+  return response.assets.map((a) => a.uri).filter((u): u is string => typeof u === 'string' && u.length > 0);
+}
+
+/**
  * Prompts user to pick an image from device files / downloads / storage using SAF.
  */
 export async function pickImageFromFiles(): Promise<PickedImageResult | null> {
@@ -256,6 +404,7 @@ export function createImageSessionFromDocument(document: Document): ImageDocumen
       fileName: document.metadata.title,
       fileSizeBytes: document.metadata.fileSizeBytes,
       lastModified: document.metadata.updatedAt,
+      exifOrientation: page?.originalContent?.sourceOrientation,
     },
     initialDirtyState: 'CLEAN',
   });
@@ -281,22 +430,46 @@ export async function createDocumentFromPickedImage(
   const docId = `doc-${Date.now()}`;
   const now = Date.now();
 
-  // Create working copy to ensure source immutability
-  const workingUri = await createImageWorkingCopy(image.uri, docId);
+  // Preferred path: durable, EXIF-normalized working copy + display preview inside the
+  // document's own storage directory. The picked source file is only read, never modified.
+  const durable = await importImageIntoDocumentStorage(image.uri, docId);
+
+  let workingUri: string;
+  let previewUri: string | undefined;
+  let orientation: number;
+  let sourceOrientation: number | undefined;
+  let mimeType = image.mimeType || 'image/jpeg';
+
+  if (durable) {
+    workingUri = durable.workingUri;
+    previewUri = durable.previewUri;
+    width = durable.width;
+    height = durable.height;
+    // The working copy is stored upright; the original EXIF value is kept as metadata.
+    orientation = 1;
+    sourceOrientation = durable.exifOrientation;
+    mimeType = durable.mimeType || mimeType;
+  } else {
+    assertImageWithinPixelBudget(width, height);
+    // Legacy path: working copy resolved as before (platforms without durable import).
+    workingUri = await createImageWorkingCopy(image.uri, docId);
+    orientation = image.orientation || 1;
+  }
 
   const session = new ImageDocumentSession({
     documentId: docId,
     sourceUri: image.uri,
     workingUri,
-    mimeType: image.mimeType || 'image/jpeg',
+    mimeType,
     intrinsicWidth: width,
     intrinsicHeight: height,
-    orientation: image.orientation || 1,
+    orientation,
     sourceMetadata: {
       fileName: image.fileName,
       fileSizeBytes: image.fileSizeBytes,
       lastModified: now,
       originalFormat: image.mimeType,
+      exifOrientation: sourceOrientation,
     },
     initialDirtyState: 'CLEAN',
   });
@@ -314,6 +487,8 @@ export async function createDocumentFromPickedImage(
       assetUri: workingUri,
       width,
       height,
+      ...(previewUri ? { previewUri } : {}),
+      ...(sourceOrientation !== undefined ? { sourceOrientation } : {}),
     },
     editableTextRegions: [],
     addedText: [],

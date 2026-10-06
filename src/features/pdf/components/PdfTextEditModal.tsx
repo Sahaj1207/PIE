@@ -1,632 +1,290 @@
-import React, { useState, useEffect } from 'react';
-import {
-  Modal,
-  View,
-  Text,
-  TextInput,
-  TouchableOpacity,
-  StyleSheet,
-  KeyboardAvoidingView,
-  Platform,
-  ScrollView,
-} from 'react-native';
+import React, { useState, useEffect, useRef } from 'react';
+import { Platform, StyleSheet, TextInput } from 'react-native';
+import { platformFontFamily } from '../../text/textLayout';
 import { PdfTextObject, PdfTextFormatOptions } from '../types';
-import { colors, radius, spacing, typography } from '../../../constants/theme';
+import {
+  DEFAULT_PDF_TEXT_STYLE,
+  PdfTextAlignment,
+  PdfTextBoxStyle,
+  PdfStandardFamily,
+  effectiveFontSize,
+  standardFontFamily,
+  uiFamilyOf,
+  unsupportedTextBoxChars,
+} from '../pdfTextBox';
+import { describeChars } from '../pdfGlyphCoverage';
+import { radius, spacing, typography } from '../../../constants/theme';
+import { useTheme } from '../../../ui/ThemeProvider';
+import { haptic } from '../../../ui/haptics';
+import {
+  ChoiceSegments,
+  ColorSwatches,
+  EditorSheet,
+  FormatGroup,
+  FormatNote,
+  FormatRow,
+  SizeStepper,
+  ToggleButton,
+} from '../../../ui/formatControls';
+
+/** Values chosen in the panel that are not part of PdfTextFormatOptions. */
+export interface PdfTextEditExtras {
+  /** Line alignment of added text (text boxes only). */
+  readonly alignment: PdfTextAlignment;
+  /** The chosen style in text-box terms (added text). */
+  readonly style: PdfTextBoxStyle;
+}
 
 interface PdfTextEditModalProps {
   visible: boolean;
   targetObject: PdfTextObject | null;
   isInsertMode?: boolean;
-  onApply: (text: string, format: PdfTextFormatOptions) => void;
+  /** Insert mode: text and style to start from (re-editing a text box, or the last used style). */
+  draft?: { readonly text: string; readonly style: PdfTextBoxStyle } | null;
+  /** Edit mode: text to start from instead of the whole object (a character selection). */
+  initialText?: string | null;
+  /**
+   * Edit mode: formatting cannot be applied (e.g. only part of a text run is selected); the
+   * reason is shown and only the text is sent.
+   */
+  formatLockedReason?: string | null;
+  onApply: (text: string, format: PdfTextFormatOptions, extras: PdfTextEditExtras) => void;
   onCancel: () => void;
 }
 
-const PRESET_SIZES = [10, 12, 14, 16, 18, 24, 32];
-const COLOR_SWATCHES = [
-  '#000000',
-  '#007AFF',
-  '#34C759',
-  '#FF3B30',
-  '#FF9500',
-  '#8E8E93',
+const PRESET_SIZES = [9, 10, 11, 12, 14, 16, 18, 24, 32];
+export const PDF_TEXT_COLORS = ['#000000', '#3A3A3C', '#8E8E93', '#007AFF', '#34C759', '#FF3B30', '#FF9500', '#AF52DE'];
+const MIN_SIZE = 6;
+const MAX_SIZE = 96;
+
+type Family = 'sans-serif' | 'serif' | 'monospace';
+
+const FAMILIES: readonly { value: Family; label: string; fontFamily: string }[] = [
+  { value: 'sans-serif', label: 'Sans', fontFamily: platformFontFamily('sans-serif', Platform.OS) },
+  { value: 'serif', label: 'Serif', fontFamily: platformFontFamily('serif', Platform.OS) },
+  { value: 'monospace', label: 'Mono', fontFamily: platformFontFamily('monospace', Platform.OS) },
 ];
+
+const ALIGNMENTS: readonly { value: PdfTextAlignment; icon: 'alignLeft' | 'alignCenter' | 'alignRight'; accessibilityLabel: string }[] = [
+  { value: 'left', icon: 'alignLeft', accessibilityLabel: 'Align Left' },
+  { value: 'center', icon: 'alignCenter', accessibilityLabel: 'Align Center' },
+  { value: 'right', icon: 'alignRight', accessibilityLabel: 'Align Right' },
+];
+
+/** Family of an existing PDF font name (standard-14 aliases and common names). */
+export function pdfFamilyOf(fontName: string | null | undefined): Family {
+  return uiFamilyOf(standardFontFamily(fontName));
+}
+
+/** Standard PDF family sent to the editor for a panel family. */
+function toStandard(family: Family): PdfStandardFamily {
+  return family === 'serif' ? 'Times-Roman' : family === 'monospace' ? 'Courier' : 'Helvetica';
+}
+
+/** Readable font name: drops the subset tag ("ABCDEF+ArialMT" -> "ArialMT"). */
+export function displayPdfFontName(fontName: string | null | undefined): string {
+  const name = (fontName || '').trim();
+  if (!name) return 'Standard font';
+  return name.replace(/^[A-Z]{6}\+/, '');
+}
 
 export const PdfTextEditModal: React.FC<PdfTextEditModalProps> = ({
   visible,
   targetObject,
   isInsertMode = false,
+  draft = null,
+  initialText = null,
+  formatLockedReason = null,
   onApply,
   onCancel,
 }) => {
-  const theme = colors.light;
+  const { colors } = useTheme();
 
   const [text, setText] = useState<string>('');
   const [fontSize, setFontSize] = useState<number>(14);
-  const [fontFamily, setFontFamily] = useState<'sans-serif' | 'serif' | 'monospace'>('sans-serif');
+  const [fontFamily, setFontFamily] = useState<Family>('sans-serif');
   const [isBold, setIsBold] = useState<boolean>(false);
   const [isItalic, setIsItalic] = useState<boolean>(false);
   const [color, setColor] = useState<string>('#000000');
+  const [alignment, setAlignment] = useState<PdfTextAlignment>('left');
+  // Replacement: values the panel opened with (unchanged style is never sent, so the original
+  // font is kept whenever possible)
+  const [initial, setInitial] = useState<{ family: Family; bold: boolean; italic: boolean; size: number; tf: number } | null>(null);
 
   const isNested = Boolean(targetObject?.objectPath && targetObject.objectPath.length > 1);
   const isEmbeddedOrSubset = Boolean(
     targetObject?.fontDetails?.isSubset || targetObject?.fontDetails?.isEmbedded,
   );
   const isStyleSupported = isInsertMode || (!isNested && !isEmbeddedOrSubset);
+  const formatLocked = !isInsertMode && !!formatLockedReason;
 
+  // Initialise once each time the panel opens (never while the user is typing)
+  const openedRef = useRef(false);
   useEffect(() => {
-    if (visible) {
-      if (isInsertMode) {
-        setText('');
-        setFontSize(14);
-        setFontFamily('sans-serif');
-        setIsBold(false);
-        setIsItalic(false);
-        setColor('#000000');
-      } else if (targetObject) {
-        setText(targetObject.text);
-        setFontSize(targetObject.fontSize ? Math.round(targetObject.fontSize) : 14);
-
-        const lowerFont = (targetObject.fontName || '').toLowerCase();
-        if (lowerFont.includes('times') || lowerFont.includes('serif') || lowerFont.includes('roman')) {
-          setFontFamily('serif');
-        } else if (lowerFont.includes('courier') || lowerFont.includes('mono')) {
-          setFontFamily('monospace');
-        } else {
-          setFontFamily('sans-serif');
-        }
-
-        setIsBold(lowerFont.includes('bold'));
-        setIsItalic(lowerFont.includes('italic') || lowerFont.includes('oblique'));
-        setColor(targetObject.color || '#000000');
-      }
+    if (!visible) {
+      openedRef.current = false;
+      return;
     }
-  }, [visible, targetObject, isInsertMode]);
+    if (openedRef.current) return;
+    openedRef.current = true;
+    if (isInsertMode) {
+      const style = draft?.style ?? DEFAULT_PDF_TEXT_STYLE;
+      setText(draft?.text ?? '');
+      setFontSize(style.fontSize);
+      setFontFamily(uiFamilyOf(style.fontFamily));
+      setIsBold(style.isBold);
+      setIsItalic(style.isItalic);
+      setColor(style.color.toUpperCase());
+      setAlignment(style.alignment);
+      setInitial(null);
+    } else if (targetObject) {
+      const lowerFont = (targetObject.fontName || '').toLowerCase();
+      const family = pdfFamilyOf(targetObject.fontName);
+      const bold = lowerFont.includes('bold') || (targetObject.fontDetails?.weight ?? 0) >= 700;
+      const italic = lowerFont.includes('italic') || lowerFont.includes('oblique');
+      // Show the size as it appears on the page (font size x text-matrix scale)
+      const visibleSize = Math.max(1, Math.round(effectiveFontSize(targetObject)));
+      setText(initialText ?? targetObject.text);
+      setFontSize(visibleSize);
+      setFontFamily(family);
+      setIsBold(bold);
+      setIsItalic(italic);
+      setColor((targetObject.color || '#000000').toUpperCase());
+      setAlignment('left');
+      setInitial({ family, bold, italic, size: visibleSize, tf: targetObject.fontSize || visibleSize });
+    }
+  }, [visible, targetObject, isInsertMode, draft, initialText]);
+
+  const style: PdfTextBoxStyle = {
+    fontFamily: toStandard(fontFamily),
+    fontSize,
+    isBold,
+    isItalic,
+    color,
+    alignment,
+  };
 
   const handleApply = () => {
-    const trimmed = text.trim();
-    if (!trimmed) return;
-
-    if (!isStyleSupported) {
-      // Preserve original font and avoid unsupported style substitutions
-      onApply(trimmed, {
-        fontSize,
-        color,
-      });
-    } else {
-      onApply(trimmed, {
-        fontFamily,
+    if (!text.trim()) return;
+    haptic('light');
+    if (isInsertMode) {
+      // Added text keeps its lines (each line becomes one PDF text line)
+      onApply(text.replace(/\s+$/u, '').replace(/^\s*\n/u, ''), {
+        fontFamily: style.fontFamily,
         fontSize,
         isBold,
         isItalic,
         color,
-      });
+      }, { alignment, style });
+      return;
     }
+    // A replacement is one text object: line breaks become spaces
+    const replacement = text.replace(/\s*\n\s*/g, ' ').trim();
+    if (formatLocked) {
+      onApply(replacement, {}, { alignment: 'left', style });
+      return;
+    }
+    const format: { -readonly [K in keyof PdfTextFormatOptions]: PdfTextFormatOptions[K] } = { color };
+    if (initial && fontSize !== initial.size) {
+      // Scale the font's own size so the visible size matches the choice
+      format.fontSize = Math.max(0.5, Math.round(initial.tf * (fontSize / initial.size) * 100) / 100);
+    } else if (initial) {
+      format.fontSize = initial.tf;
+    }
+    if (isStyleSupported && initial && (fontFamily !== initial.family || isBold !== initial.bold || isItalic !== initial.italic)) {
+      format.fontFamily = style.fontFamily;
+      format.isBold = isBold;
+      format.isItalic = isItalic;
+    }
+    onApply(replacement, format, { alignment: 'left', style });
   };
 
-  const title = isInsertMode ? 'Add Text' : 'Edit Text';
-  const subtitle = isInsertMode
-    ? 'Enter text to add to this page'
-    : 'Edit the selected text and choose formatting';
+  const canApply = text.trim().length > 0;
+  const swatches = PDF_TEXT_COLORS.includes(color.toUpperCase()) ? PDF_TEXT_COLORS : [color.toUpperCase(), ...PDF_TEXT_COLORS];
+  const unsupported = isInsertMode ? unsupportedTextBoxChars(text) : [];
+  const isReEdit = isInsertMode && !!draft?.text;
 
   return (
-    <Modal
+    <EditorSheet
       visible={visible}
-      animationType="slide"
-      transparent={true}
-      onRequestClose={onCancel}>
-      <KeyboardAvoidingView
-        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-        style={styles.modalOverlay}>
-        <TouchableOpacity
-          style={styles.backdrop}
-          activeOpacity={1}
-          onPress={onCancel}
-        />
+      title={isInsertMode ? (isReEdit ? 'Edit Text Box' : 'Add Text') : 'Edit Text'}
+      confirmLabel={isInsertMode && !isReEdit ? 'Add' : 'Done'}
+      confirmDisabled={!canApply || unsupported.length > 0}
+      onConfirm={handleApply}
+      onCancel={onCancel}>
+      <TextInput
+        value={text}
+        onChangeText={setText}
+        style={[
+          styles.textInput,
+          {
+            backgroundColor: colors.cell,
+            color: colors.textPrimary,
+            fontWeight: isStyleSupported && isBold ? '700' : '400',
+            fontStyle: isStyleSupported && isItalic ? 'italic' : 'normal',
+            fontFamily: isStyleSupported ? platformFontFamily(fontFamily, Platform.OS) : undefined,
+            textAlign: isInsertMode ? alignment : 'left',
+          },
+        ]}
+        placeholder={isInsertMode ? 'Type your text — new lines are kept' : 'Replacement text'}
+        placeholderTextColor={colors.textMuted}
+        multiline
+        autoFocus
+        selectTextOnFocus={!isInsertMode || isReEdit}
+        accessibilityLabel="Text"
+      />
 
-        <View style={styles.sheetContainer}>
-          {/* iOS Grabber */}
-          <View style={styles.grabberContainer}>
-            <View style={styles.grabber} />
-          </View>
+      {unsupported.length > 0 && (
+        <FormatNote icon="info">
+          {`${describeChars(unsupported)} can't be added with the built-in PDF fonts (Latin text, digits and common symbols only).`}
+        </FormatNote>
+      )}
 
-          {/* Header */}
-          <View style={styles.sheetHeader}>
-            <View style={styles.headerTitles}>
-              <Text style={styles.sheetTitle}>{title}</Text>
-              <Text style={styles.sheetSubtitle}>{subtitle}</Text>
-            </View>
-            <TouchableOpacity
-              onPress={onCancel}
-              style={styles.closeBtn}
-              accessibilityLabel="Close dialog">
-              <Text style={styles.closeBtnText}>✕</Text>
-            </TouchableOpacity>
-          </View>
+      {formatLocked && <FormatNote icon="lock">{formatLockedReason}</FormatNote>}
 
-          <ScrollView style={styles.sheetBody} showsVerticalScrollIndicator={false}>
-            {/* Original Font Metadata Banner for Existing Text */}
-            {!isInsertMode && targetObject && (
-              <View style={styles.metadataCard}>
-                <View style={styles.metadataRow}>
-                  <Text style={styles.metadataLabel}>Original Font:</Text>
-                  <Text style={styles.metadataValue} numberOfLines={1}>
-                    {targetObject.fontName || 'Standard Font'}
-                  </Text>
-                </View>
-                {!isStyleSupported && (
-                  <View style={styles.unsupportedBadgeContainer}>
-                    <Text style={styles.unsupportedBadgeText}>
-                      {isEmbeddedOrSubset ? 'Embedded Subset Font' : 'Form XObject'}
-                    </Text>
-                    <Text style={styles.unsupportedHelpText}>
-                      Original font preserved. Font family and bold/italic style modification is unsupported on {isEmbeddedOrSubset ? 'subset fonts' : 'nested Form XObjects'}.
-                    </Text>
-                  </View>
-                )}
-              </View>
-            )}
+      {!isInsertMode && targetObject && !formatLocked && (
+        <FormatNote icon={isStyleSupported ? 'info' : 'lock'}>
+          {isStyleSupported
+            ? `Font: ${displayPdfFontName(targetObject.fontName)}`
+            : `Keeps the original ${isEmbeddedOrSubset ? 'embedded ' : ''}font (${displayPdfFontName(targetObject.fontName)}). Size and colour can change; family and bold/italic can't.`}
+        </FormatNote>
+      )}
 
-            {/* Text Input */}
-            <Text style={styles.sectionLabel}>Text</Text>
-            <TextInput
-              value={text}
-              onChangeText={setText}
-              style={styles.textInput}
-              placeholder={isInsertMode ? 'Enter text here...' : 'Enter replacement text...'}
-              placeholderTextColor={theme.textMuted}
-              multiline
-              autoFocus
-              selectTextOnFocus={!isInsertMode}
-            />
-
-            {/* Font Family Segmented Control */}
-            <Text style={styles.sectionLabel}>Font</Text>
-            <View
-              style={[
-                styles.segmentGroup,
-                !isStyleSupported && styles.disabledSection,
-              ]}
-              pointerEvents={isStyleSupported ? 'auto' : 'none'}>
-              <TouchableOpacity
-                disabled={!isStyleSupported}
-                onPress={() => setFontFamily('sans-serif')}
-                style={[styles.segmentBtn, fontFamily === 'sans-serif' && styles.segmentBtnActive]}>
-                <Text style={[styles.segmentText, fontFamily === 'sans-serif' && styles.segmentTextActive]}>
-                  System
-                </Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                disabled={!isStyleSupported}
-                onPress={() => setFontFamily('serif')}
-                style={[styles.segmentBtn, fontFamily === 'serif' && styles.segmentBtnActive]}>
-                <Text style={[styles.segmentText, fontFamily === 'serif' && styles.segmentTextActive, { fontFamily: 'serif' }]}>
-                  Serif
-                </Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                disabled={!isStyleSupported}
-                onPress={() => setFontFamily('monospace')}
-                style={[styles.segmentBtn, fontFamily === 'monospace' && styles.segmentBtnActive]}>
-                <Text style={[styles.segmentText, fontFamily === 'monospace' && styles.segmentTextActive, { fontFamily: 'monospace' }]}>
-                  Mono
-                </Text>
-              </TouchableOpacity>
-            </View>
-
-            {/* Style & Size Row */}
-            <View style={styles.row}>
-              {/* Style Buttons */}
-              <View style={styles.flexHalf}>
-                <Text style={styles.sectionLabel}>Style</Text>
-                <View
-                  style={[
-                    styles.styleGroup,
-                    !isStyleSupported && styles.disabledSection,
-                  ]}
-                  pointerEvents={isStyleSupported ? 'auto' : 'none'}>
-                  <TouchableOpacity
-                    disabled={!isStyleSupported}
-                    onPress={() => setIsBold(!isBold)}
-                    style={[styles.styleBtn, isBold && styles.styleBtnActive]}>
-                    <Text style={[styles.styleBtnText, isBold && styles.styleBtnTextActive, { fontWeight: '700' }]}>
-                      B
-                    </Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity
-                    disabled={!isStyleSupported}
-                    onPress={() => setIsItalic(!isItalic)}
-                    style={[styles.styleBtn, isItalic && styles.styleBtnActive]}>
-                    <Text style={[styles.styleBtnText, isItalic && styles.styleBtnTextActive, { fontStyle: 'italic' }]}>
-                      I
-                    </Text>
-                  </TouchableOpacity>
-                </View>
-              </View>
-
-              {/* Font Size Stepper */}
-              <View style={styles.flexHalf}>
-                <Text style={styles.sectionLabel}>Size ({fontSize} pt)</Text>
-                <View style={styles.stepperContainer}>
-                  <TouchableOpacity
-                    onPress={() => setFontSize(Math.max(8, fontSize - 2))}
-                    style={styles.stepBtn}>
-                    <Text style={styles.stepBtnText}>−</Text>
-                  </TouchableOpacity>
-                  <Text style={styles.currentSizeText}>{fontSize}</Text>
-                  <TouchableOpacity
-                    onPress={() => setFontSize(Math.min(72, fontSize + 2))}
-                    style={styles.stepBtn}>
-                    <Text style={styles.stepBtnText}>+</Text>
-                  </TouchableOpacity>
-                </View>
-              </View>
-            </View>
-
-            {/* Size Presets */}
-            <View style={styles.presetRow}>
-              {PRESET_SIZES.map((sz) => (
-                <TouchableOpacity
-                  key={sz}
-                  onPress={() => setFontSize(sz)}
-                  style={[styles.presetBtn, fontSize === sz && styles.presetBtnActive]}>
-                  <Text style={[styles.presetBtnText, fontSize === sz && styles.presetBtnTextActive]}>
-                    {sz}
-                  </Text>
-                </TouchableOpacity>
-              ))}
-            </View>
-
-            {/* Color Swatches */}
-            <Text style={styles.sectionLabel}>Color</Text>
-            <View style={styles.swatchRow}>
-              {COLOR_SWATCHES.map((hex) => (
-                <TouchableOpacity
-                  key={hex}
-                  onPress={() => setColor(hex)}
-                  style={[
-                    styles.swatch,
-                    { backgroundColor: hex },
-                    color === hex && styles.swatchActive,
-                  ]}>
-                  {color === hex && (
-                    <Text style={[styles.swatchCheck, { color: hex === '#000000' ? '#FFFFFF' : '#FFFFFF' }]}>
-                      ✓
-                    </Text>
-                  )}
-                </TouchableOpacity>
-              ))}
-            </View>
-          </ScrollView>
-
-          {/* Action Buttons */}
-          <View style={styles.sheetFooter}>
-            <TouchableOpacity
-              onPress={onCancel}
-              style={styles.cancelBtn}>
-              <Text style={styles.cancelBtnText}>Cancel</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              onPress={handleApply}
-              disabled={text.trim().length === 0}
-              style={[
-                styles.applyBtn,
-                text.trim().length === 0 && styles.applyBtnDisabled,
-              ]}>
-              <Text style={styles.applyBtnText}>
-                {isInsertMode ? 'Insert Text' : 'Apply Changes'}
-              </Text>
-            </TouchableOpacity>
-          </View>
-        </View>
-      </KeyboardAvoidingView>
-    </Modal>
+      {!formatLocked && (
+      <FormatGroup>
+        <FormatRow label="Font" disabled={!isStyleSupported} accessibilityHint={isStyleSupported ? undefined : 'Locked to the original font'}>
+          <ChoiceSegments options={FAMILIES} value={fontFamily} onChange={setFontFamily} />
+          <ToggleButton icon="bold" label="Bold" active={isBold} onToggle={() => setIsBold((b) => !b)} />
+          <ToggleButton icon="italic" label="Italic" active={isItalic} onToggle={() => setIsItalic((i) => !i)} />
+        </FormatRow>
+        <FormatRow label="Size">
+          <SizeStepper value={fontSize} onChange={setFontSize} min={MIN_SIZE} max={MAX_SIZE} presets={PRESET_SIZES} />
+        </FormatRow>
+        {isInsertMode && (
+          <FormatRow label="Align">
+            <ChoiceSegments options={ALIGNMENTS} value={alignment} onChange={setAlignment} style={styles.alignSegments} />
+          </FormatRow>
+        )}
+        <FormatRow label="Colour">
+          <ColorSwatches colors={swatches} value={color} onChange={setColor} accessibilityPrefix="Text colour" />
+        </FormatRow>
+      </FormatGroup>
+      )}
+    </EditorSheet>
   );
 };
 
 const styles = StyleSheet.create({
-  modalOverlay: {
-    flex: 1,
-    justifyContent: 'flex-end',
-    backgroundColor: 'rgba(0, 0, 0, 0.45)',
-  },
-  backdrop: {
-    ...StyleSheet.absoluteFill,
-  },
-  sheetContainer: {
-    backgroundColor: '#FFFFFF',
-    borderTopLeftRadius: radius.lg,
-    borderTopRightRadius: radius.lg,
-    paddingTop: spacing.xs,
-    paddingBottom: Platform.OS === 'ios' ? spacing.xl : spacing.md,
-    maxHeight: '85%',
-    shadowColor: '#000000',
-    shadowOffset: { width: 0, height: -4 },
-    shadowOpacity: 0.1,
-    shadowRadius: 12,
-    elevation: 16,
-  },
-  grabberContainer: {
-    alignItems: 'center',
-    paddingVertical: spacing.xs,
-  },
-  grabber: {
-    width: 36,
-    height: 4,
-    borderRadius: 2,
-    backgroundColor: '#D1D1D6',
-  },
-  sheetHeader: {
-    flexDirection: 'row',
-    alignItems: 'flex-start',
-    justifyContent: 'space-between',
-    paddingHorizontal: spacing.md,
-    paddingBottom: spacing.sm,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: '#E5E5EA',
-  },
-  headerTitles: {
-    flex: 1,
-  },
-  sheetTitle: {
-    ...typography.titleMedium,
-    color: '#000000',
-    fontWeight: '700',
-  },
-  sheetSubtitle: {
-    ...typography.caption,
-    color: '#8E8E93',
-    marginTop: 2,
-  },
-  closeBtn: {
-    padding: spacing.xs,
-    marginLeft: spacing.sm,
-  },
-  closeBtnText: {
-    fontSize: 16,
-    color: '#8E8E93',
-    fontWeight: '600',
-  },
-  sheetBody: {
-    paddingHorizontal: spacing.md,
-    paddingVertical: spacing.sm,
-  },
-  metadataCard: {
-    backgroundColor: '#F2F2F7',
-    borderRadius: radius.sm,
-    padding: spacing.sm,
-    marginBottom: spacing.sm,
-  },
-  metadataRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-  },
-  metadataLabel: {
-    ...typography.caption,
-    color: '#8E8E93',
-    fontWeight: '600',
-  },
-  metadataValue: {
-    ...typography.caption,
-    color: '#1C1C1E',
-    fontWeight: '700',
-    flex: 1,
-    textAlign: 'right',
-    marginLeft: spacing.xs,
-  },
-  unsupportedBadgeContainer: {
-    marginTop: spacing.xs,
-    paddingTop: spacing.xs,
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: '#E5E5EA',
-  },
-  unsupportedBadgeText: {
-    fontSize: 11,
-    fontWeight: '700',
-    color: '#FF9500',
-    marginBottom: 2,
-  },
-  unsupportedHelpText: {
-    fontSize: 11,
-    color: '#8E8E93',
-    lineHeight: 14,
-  },
-  disabledSection: {
-    opacity: 0.45,
-  },
-  sectionLabel: {
-    ...typography.bodyMedium,
-    fontWeight: '600',
-    color: '#1C1C1E',
-    marginTop: spacing.sm,
-    marginBottom: spacing.xs,
-  },
   textInput: {
-    borderWidth: 1,
-    borderColor: '#E5E5EA',
-    borderRadius: radius.sm,
-    padding: spacing.sm,
-    fontSize: 16,
-    color: '#000000',
-    minHeight: 70,
-    backgroundColor: '#FAFAFA',
+    minHeight: 64,
+    maxHeight: 150,
+    borderRadius: radius.md,
+    paddingHorizontal: spacing.md,
+    paddingTop: 10,
+    paddingBottom: 10,
+    ...typography.bodyLarge,
+    lineHeight: undefined,
     textAlignVertical: 'top',
   },
-  segmentGroup: {
-    flexDirection: 'row',
-    backgroundColor: '#F2F2F7',
-    borderRadius: radius.sm,
-    padding: 2,
-  },
-  segmentBtn: {
-    flex: 1,
-    paddingVertical: spacing.xs,
-    alignItems: 'center',
-    borderRadius: radius.sm - 2,
-  },
-  segmentBtnActive: {
-    backgroundColor: '#FFFFFF',
-    shadowColor: '#000000',
-    shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.15,
-    shadowRadius: 2,
-    elevation: 2,
-  },
-  segmentText: {
-    ...typography.bodyMedium,
-    color: '#8E8E93',
-    fontWeight: '500',
-  },
-  segmentTextActive: {
-    color: '#007AFF',
-    fontWeight: '600',
-  },
-  row: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    gap: spacing.md,
-  },
-  flexHalf: {
-    flex: 1,
-  },
-  styleGroup: {
-    flexDirection: 'row',
-    gap: spacing.xs,
-  },
-  styleBtn: {
-    flex: 1,
-    borderWidth: 1,
-    borderColor: '#E5E5EA',
-    borderRadius: radius.sm,
-    paddingVertical: spacing.xs,
-    alignItems: 'center',
-    backgroundColor: '#FAFAFA',
-  },
-  styleBtnActive: {
-    backgroundColor: '#007AFF',
-    borderColor: '#007AFF',
-  },
-  styleBtnText: {
-    ...typography.bodyMedium,
-    color: '#1C1C1E',
-  },
-  styleBtnTextActive: {
-    color: '#FFFFFF',
-  },
-  stepperContainer: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    borderWidth: 1,
-    borderColor: '#E5E5EA',
-    borderRadius: radius.sm,
-    backgroundColor: '#FAFAFA',
-    overflow: 'hidden',
-  },
-  stepBtn: {
-    paddingHorizontal: spacing.sm,
-    paddingVertical: spacing.xs,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  stepBtnText: {
-    fontSize: 18,
-    fontWeight: '600',
-    color: '#007AFF',
-  },
-  currentSizeText: {
-    ...typography.bodyMedium,
-    fontWeight: '700',
-    color: '#1C1C1E',
-    minWidth: 28,
-    textAlign: 'center',
-  },
-  presetRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    marginTop: spacing.xs,
-    gap: 4,
-  },
-  presetBtn: {
-    flex: 1,
-    borderWidth: 1,
-    borderColor: '#E5E5EA',
-    borderRadius: radius.sm,
-    paddingVertical: 4,
-    alignItems: 'center',
-    backgroundColor: '#FAFAFA',
-  },
-  presetBtnActive: {
-    backgroundColor: '#007AFF',
-    borderColor: '#007AFF',
-  },
-  presetBtnText: {
-    fontSize: 12,
-    color: '#8E8E93',
-    fontWeight: '500',
-  },
-  presetBtnTextActive: {
-    color: '#FFFFFF',
-    fontWeight: '700',
-  },
-  swatchRow: {
-    flexDirection: 'row',
-    gap: spacing.sm,
-    alignItems: 'center',
-  },
-  swatch: {
-    width: 32,
-    height: 32,
-    borderRadius: 16,
-    alignItems: 'center',
-    justifyContent: 'center',
-    borderWidth: 2,
-    borderColor: 'transparent',
-  },
-  swatchActive: {
-    borderColor: '#007AFF',
-    transform: [{ scale: 1.15 }],
-  },
-  swatchCheck: {
-    fontSize: 14,
-    fontWeight: '700',
-  },
-  sheetFooter: {
-    flexDirection: 'row',
-    paddingHorizontal: spacing.md,
-    paddingTop: spacing.sm,
-    gap: spacing.sm,
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: '#E5E5EA',
-  },
-  cancelBtn: {
-    flex: 1,
-    borderWidth: 1,
-    borderColor: '#D1D1D6',
-    borderRadius: radius.sm,
-    paddingVertical: spacing.sm,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  cancelBtnText: {
-    ...typography.titleSmall,
-    color: '#8E8E93',
-    fontWeight: '600',
-  },
-  applyBtn: {
-    flex: 2,
-    backgroundColor: '#007AFF',
-    borderRadius: radius.sm,
-    paddingVertical: spacing.sm,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  applyBtnDisabled: {
-    backgroundColor: '#B0B0B5',
-  },
-  applyBtnText: {
-    ...typography.titleSmall,
-    color: '#FFFFFF',
-    fontWeight: '700',
-  },
+  alignSegments: { flex: 0, width: 132 },
 });

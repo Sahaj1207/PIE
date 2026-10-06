@@ -78,6 +78,12 @@ class MockPdfiumEngine implements IPdfiumEngine {
     ];
   }
 
+  // Verified copy (Save with no queued commands). Test double only: emulates the native
+  // copy through this mock's batch implementation so failure injection still applies.
+  async copyDocument(inputPdfPath: string, outputPdfPath: string): Promise<PdfMultiEditResult> {
+    return this.applyBatchEdits({ inputPdfPath, outputPdfPath, commands: [] });
+  }
+
   async applyBatchEdits(request: any): Promise<PdfMultiEditResult> {
     this.batchEditCalls.push(request);
     if (this.shouldFailBatchEdit) {
@@ -408,7 +414,28 @@ describe('Phase 4B: Cross-Editor Integration & Production Hardening', () => {
 
       await expect(savePromise2).rejects.toThrow('A save operation is already in progress');
 
-      resolveSave!({ outputPdfPath: 'file:///data/dup_out.pdf', success: true, modifiedPageCount: 1, savedFileSizeBytes: 100 });
+      // Phase 12: a save must report its applied, reopen-verified edits to succeed.
+      resolveSave!({
+        outputPath: 'file:///data/dup_out.pdf',
+        totalCommands: 1,
+        appliedCommands: 1,
+        pageCountBefore: 2,
+        pageCountAfter: 2,
+        sourceUnchanged: true,
+        sourceChecksumBefore: 'abc',
+        sourceChecksumAfter: 'abc',
+        commands: [
+          { type: 'replace', objectId: 'p0_obj1', pageIndex: 0, objectIndex: 1, status: 'applied', verifiedInReopened: true },
+        ],
+        reopenedVerification: {
+          allReplacementsVerified: true,
+          allDeletionsVerified: true,
+          verifiedReplacements: ['Edit'],
+          missingReplacements: [],
+          residualDeletions: [],
+        },
+        limitations: [],
+      });
       await savePromise1;
       await pdfEditor.close();
     });

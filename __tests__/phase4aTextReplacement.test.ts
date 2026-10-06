@@ -194,6 +194,11 @@ describe('Phase 4A — PDF Existing Text Replacement', () => {
         });
       }),
       createEditor: jest.fn(),
+      // Verified copy (Save with no queued commands). Test double only: emulates the native
+      // copy through this mock's batch implementation so failure injection still applies.
+      copyDocument: jest.fn((inputPdfPath: string, outputPdfPath: string) =>
+        mockEngine.applyBatchEdits({ inputPdfPath, outputPdfPath, commands: [] }),
+      ),
     };
   });
 

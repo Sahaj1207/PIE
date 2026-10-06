@@ -384,7 +384,41 @@ describe('Phase 3E — PDF Workflow Hardening & Production Readiness', () => {
 
     // Slow down native call slightly to test concurrency
     NativeModules.PdfiumNativeModule.applyBatchEdits.mockImplementationOnce(
-      () => new Promise(resolve => setTimeout(() => resolve('{"appliedCommands":1,"sourceUnchanged":true}'), 100)),
+      (input: string, output: string, json: string) => {
+        const cmds = JSON.parse(json);
+        const payload = JSON.stringify({
+          outputPath: output,
+          totalCommands: cmds.length,
+          appliedCommands: cmds.length,
+          pageCountBefore: 2,
+          pageCountAfter: 2,
+          sourceUnchanged: true,
+          sourceChecksumBefore: 'sha256_mock_hash_before',
+          sourceChecksumAfter: 'sha256_mock_hash_before',
+          commands: cmds.map((c: any) => ({
+            type: c.type,
+            objectId: c.objectId,
+            pageIndex: c.pageIndex,
+            objectIndex: c.objectIndex ?? 0,
+            status: 'applied',
+            originalText: c.originalText,
+            newText: c.newText ?? c.text,
+            fontStrategy: 'LOADED_STANDARD',
+            fontReused: false,
+          })),
+          reopenedVerification: {
+            allReplacementsVerified: true,
+            allDeletionsVerified: true,
+            verifiedReplacements: cmds
+              .filter((c: any) => c.type === 'replace' || c.type === 'insert')
+              .map((c: any) => c.newText ?? c.text),
+            missingReplacements: [],
+            residualDeletions: [],
+          },
+          limitations: [],
+        });
+        return new Promise((resolve) => setTimeout(() => resolve(payload), 100));
+      },
     );
 
     const firstSavePromise = editor.saveEdits('/data/out1.pdf');
