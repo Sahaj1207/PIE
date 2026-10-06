@@ -18,6 +18,9 @@ import kotlin.math.sqrt
  *     r = clamp(round(0.06 * box height), 1, 4);
  *  4. only masked pixels are filled, outside-in (8-connected distance layers), from the
  *     inverse-squared-distance weighted average of known pixels in a 9x9 window;
+ *  4c. grain: each filled pixel gets the fine-detail residual (pixel minus its 5x5 mean, RGB
+ *     together) of a real background pixel picked by an integer hash of its position, clamped
+ *     to +-T/2 (sources: 5x5 window without masked pixels, within T of the plane; >= 16);
  *  5. fallback to the plane fill (2 px feathered edge) when < 0.2% or > 60% of the target is
  *     flagged.
  * All coordinates are region-local (the region = target + border ring).
@@ -28,6 +31,17 @@ object TextInpainting {
     private const val WINDOW_RADIUS = 4
     private const val MIN_MASK_FRACTION = 0.002
     private const val MAX_MASK_FRACTION = 0.6
+    private const val GRAIN_RADIUS = 2
+    private const val GRAIN_MIN_SOURCES = 16
+
+    /** Deterministic 32-bit position hash (identical to grainHash in textInpainting.ts). */
+    private fun grainHash(x: Int, y: Int): Long {
+        var h = (x * 73856093) xor (y * 19349663)
+        h = h xor (h ushr 13)
+        h *= 0x5bd1e995
+        h = h xor (h ushr 15)
+        return h.toLong() and 0xFFFFFFFFL
+    }
 
     class Result(
         /** ARGB patch of the target rectangle (opaque). */
@@ -279,6 +293,49 @@ object TextInpainting {
                 work[k * 3] = pr.at(x, y)
                 work[k * 3 + 1] = pg.at(x, y)
                 work[k * 3 + 2] = pb.at(x, y)
+            }
+        }
+
+        // 4c. Grain from the real background
+        val g = GRAIN_RADIUS
+        val nn = ((2 * g + 1) * (2 * g + 1)).toDouble()
+        val residual = DoubleArray(cap * 3)
+        var sources = 0
+        for (y in g until h - g) {
+            for (x in g until w - g) {
+                if (distToPlane(x, y) > threshold) continue
+                var ok = true
+                var s0 = 0; var s1 = 0; var s2 = 0
+                var dy = -g
+                while (dy <= g && ok) {
+                    for (dx in -g..g) {
+                        val kk = (y + dy) * w + (x + dx)
+                        if (mask[kk]) {
+                            ok = false
+                            break
+                        }
+                        s0 += red(kk); s1 += green(kk); s2 += blue(kk)
+                    }
+                    dy++
+                }
+                if (!ok) continue
+                val k = y * w + x
+                residual[sources * 3] = red(k) - s0 / nn
+                residual[sources * 3 + 1] = green(k) - s1 / nn
+                residual[sources * 3 + 2] = blue(k) - s2 / nn
+                sources++
+            }
+        }
+        if (sources >= GRAIN_MIN_SOURCES) {
+            val lim = threshold / 2
+            for (q in 0 until tail) {
+                val k = queue[q]
+                val x = k % w; val y = k / w
+                val s = (grainHash(x, y) % sources).toInt()
+                for (c in 0 until 3) {
+                    val e = residual[s * 3 + c]
+                    work[k * 3 + c] += if (e < -lim) -lim else if (e > lim) lim else e
+                }
             }
         }
 

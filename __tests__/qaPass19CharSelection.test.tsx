@@ -30,6 +30,7 @@ import { PdfDocumentEditor } from '../src/features/pdf/pdfDocumentEditor';
 import { PdfTextObject } from '../src/features/pdf/types';
 import { PdfTextEditModal } from '../src/features/pdf/components/PdfTextEditModal';
 import { DEFAULT_SETTINGS, sanitizeSettings } from '../src/settings/appSettings';
+import { estimateFontSizeFromLine } from '../src/features/ocr/normalization';
 
 const ROOT = path.join(__dirname, '..');
 const read = (rel: string) => fs.readFileSync(path.join(ROOT, rel), 'utf8');
@@ -323,6 +324,18 @@ describe('QA19 edit panel for a partial selection', () => {
   });
 });
 
+describe('QA19 OCR font size estimate (release QA: replaced text drew ~77% of the original size)', () => {
+  it('uses the glyph extent the line actually has', () => {
+    // Device measurements, 36 px Arial: capitals + descenders -> box ~1.00 em
+    expect(estimateFontSizeFromLine('Total amount 2500 rupees', 36)).toBe(36);
+    // capitals / digits, no descenders -> box ~0.73 em
+    expect(estimateFontSizeFromLine('Invoice number 4471', 26.3)).toBe(36);
+    // lowercase without ascenders or descenders: x-height only
+    expect(estimateFontSizeFromLine('was on', 19)).toBe(36);
+    expect(estimateFontSizeFromLine('x', 2)).toBe(8); // floor
+  });
+});
+
 describe('QA19 settings', () => {
   it('remembers the selection tip', () => {
     expect(DEFAULT_SETTINGS.pdfSelectionTipSeen).toBe(false);
@@ -339,6 +352,12 @@ describe('QA19 native fixes (source checks; behaviour verified on device with pi
     expect(bridge).toContain('FPDFFormObj_RemoveObject');
     expect(bridge).toContain('FPDFPageObj_TransformClipPath');
     expect(bridge).toContain('FPDFPage_InsertObjectAtIndex');
+  });
+
+  it('closing a deleted span keeps the larger of the two surrounding gaps (letter-spaced words)', () => {
+    // Device QA: replacing "c l i ent" (one object per letter) left "customeri nformation"
+    expect(bridge).toContain('bool pieLeftNeighbourRight(FPDF_PAGE page, const PieBox& line, float x, float& outRight)');
+    expect(bridge).toMatch(/target = prevRight \+ std::max\(gapBefore, gapAfter\);/);
   });
 
   it('replace / delete reflow the rest of the line, and characters are exported per page', () => {

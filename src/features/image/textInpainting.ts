@@ -16,6 +16,11 @@
  *     inverse-squared-distance weighted average of already-known pixels within a 9x9 window.
  *     All other pixels keep their original values, so the background texture between and
  *     around the letters is preserved exactly.
+ *  4c. Grain: the average is smoother than real texture, so each filled pixel gets the
+ *     fine-detail residual (pixel minus its 5x5 mean, RGB together) of a real background pixel
+ *     picked by an integer hash of its position, clamped to +-T/2. Sources are pixels whose 5x5
+ *     window has no masked pixel and that are within T of the plane (not text). Skipped with
+ *     fewer than 16 sources; a flat background has zero residuals, so nothing changes there.
  *  5. Fallback to the previous plane fill (2 px feathered edge) when the mask is unreliable:
  *     almost nothing detected (< 0.2% of the target) or most of the target flagged (> 60%).
  *
@@ -61,6 +66,19 @@ export const INPAINT_MAX_THRESHOLD = 110;
 export const INPAINT_WINDOW_RADIUS = 4;
 export const INPAINT_MIN_MASK_FRACTION = 0.002;
 export const INPAINT_MAX_MASK_FRACTION = 0.6;
+export const INPAINT_GRAIN_RADIUS = 2;
+export const INPAINT_GRAIN_MIN_SOURCES = 16;
+
+/** Deterministic 32-bit position hash (identical in the Kotlin and C ports). */
+/* eslint-disable no-bitwise -- 32-bit integer hash, bit-identical across ports */
+export function grainHash(x: number, y: number): number {
+  let h = Math.imul(x, 73856093) ^ Math.imul(y, 19349663);
+  h ^= h >>> 13;
+  h = Math.imul(h, 0x5bd1e995);
+  h ^= h >>> 15;
+  return h >>> 0;
+}
+/* eslint-enable no-bitwise */
 
 interface Plane {
   c0: number;
@@ -291,6 +309,47 @@ export function reconstructTextPatch(region: RgbaImage, target: IntRect, box: In
       work[k * 3] = pr0;
       work[k * 3 + 1] = pg0;
       work[k * 3 + 2] = pb0;
+    }
+  }
+
+  // 4c. Grain from the real background (see header)
+  const G = INPAINT_GRAIN_RADIUS;
+  const nn = (2 * G + 1) * (2 * G + 1);
+  const residual = new Float64Array(cap * 3);
+  let sources = 0;
+  for (let y = G; y < H - G; y++) {
+    for (let x = G; x < W - G; x++) {
+      if (distToPlane(x, y) > threshold) continue;
+      let ok = true;
+      let s0 = 0, s1 = 0, s2 = 0;
+      for (let dy = -G; dy <= G && ok; dy++) {
+        for (let dx = -G; dx <= G; dx++) {
+          const kk = (y + dy) * W + (x + dx);
+          if (mask[kk]) {
+            ok = false;
+            break;
+          }
+          s0 += px[kk * 4]; s1 += px[kk * 4 + 1]; s2 += px[kk * 4 + 2];
+        }
+      }
+      if (!ok) continue;
+      const k = y * W + x;
+      residual[sources * 3] = px[k * 4] - s0 / nn;
+      residual[sources * 3 + 1] = px[k * 4 + 1] - s1 / nn;
+      residual[sources * 3 + 2] = px[k * 4 + 2] - s2 / nn;
+      sources++;
+    }
+  }
+  if (sources >= INPAINT_GRAIN_MIN_SOURCES) {
+    const lim = threshold / 2;
+    for (let q = 0; q < tail; q++) {
+      const k = queue[q];
+      const x = k % W, y = (k - x) / W;
+      const s = grainHash(x, y) % sources;
+      for (let c = 0; c < 3; c++) {
+        const e = residual[s * 3 + c];
+        work[k * 3 + c] += e < -lim ? -lim : e > lim ? lim : e;
+      }
     }
   }
 

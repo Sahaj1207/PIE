@@ -158,7 +158,9 @@ describe('OCR Coordinate Normalization', () => {
       expect(regions[0].status).toBe('detected');
       expect(regions[0].confidence).toBe(0.95);
       expect(regions[0].bounds).toEqual({ x: 10, y: 20, width: 200, height: 30 });
-      expect(regions[0].style.fontSize).toBe(23); // Math.round(30 * 0.75)
+      // Capitals, no descenders: 30 / (0.72 + 0.01) (was 0.75 x height, which drew replacements
+      // ~23% too small on device)
+      expect(regions[0].style.fontSize).toBe(41);
     });
 
     test('filters out blank whitespace lines', () => {

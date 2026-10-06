@@ -4,7 +4,7 @@
 #define H 40
 static uint8_t img[W * H * 4];
 static uint8_t patch[64 * 32 * 4];
-static uint8_t scratch[W * H * 80 + 1024];
+static uint8_t scratch[W * H * 112 + 1024];
 static PieInpaintResult result;
 
 static void set(int x, int y, int r, int g, int b) {

@@ -195,6 +195,21 @@ export function normalizeRawNativeOcrResult(
   };
 }
 
+// Vertical extent of an OCR line box in em, for typical sans/serif fonts (Arial / Roboto / Times):
+// capitals, digits and ascenders reach ~0.72 em, lowercase-only text ~0.52 em (x-height);
+// descenders add ~0.27 em; ML Kit boxes are glyph-tight (~0.01 em padding). Calibrated on device
+// with 36 px Arial lines: box = 0.73 em without descenders, 1.00 em with them.
+const OCR_TALL = /[A-Z0-9bdfhiklt()[\]{}/\\|!?'"#$%&@^*]|[\u0080-￿]/;
+const OCR_DESCENDER = /[gjpqy,;()[\]{}|@]/;
+const OCR_BOX_PADDING_EM = 0.01;
+
+/** Font size (in the box's units) whose glyphs fill an OCR line box of this text and height. */
+export function estimateFontSizeFromLine(text: string, boxHeight: number): number {
+  const top = OCR_TALL.test(text) ? 0.72 : 0.52;
+  const bottom = OCR_DESCENDER.test(text) ? 0.27 : 0;
+  return Math.max(8, Math.round(boxHeight / (top + bottom + OCR_BOX_PADDING_EM)));
+}
+
 /**
  * Transforms an OcrResult or OcrDocument into editable TextRegion[] elements for the Document model.
  */
@@ -209,8 +224,8 @@ export function ocrResultToTextRegions(
     for (const line of block.lines) {
       if (!line.text.trim()) continue;
 
-      // Approximate font size from line bounding box height
-      const estimatedFontSize = Math.max(8, Math.round(line.bounds.height * 0.75));
+      // Font size from the line box height and which parts of the glyph range the text uses
+      const estimatedFontSize = estimateFontSizeFromLine(line.text, line.bounds.height);
 
       regions.push({
         id: `text-region-${pageIndex}-${regionCounter++}`,

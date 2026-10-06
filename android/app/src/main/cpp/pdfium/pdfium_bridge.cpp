@@ -693,6 +693,22 @@ std::vector<std::pair<FPDF_PAGEOBJECT, PieBox>> pieFollowingRun(FPDF_PAGE page, 
     return run;
 }
 
+// Right edge of the nearest root-level text on `line` that ends at or before `x` (within one
+// line height, i.e. not across a column gap). Returns false when there is none.
+bool pieLeftNeighbourRight(FPDF_PAGE page, const PieBox& line, float x, float& outRight) {
+    bool found = false;
+    const float maxGap = std::max(1.0f, line.size);
+    const int count = FPDFPage_CountObjects(page);
+    for (int i = 0; i < count; ++i) {
+        PieBox box;
+        if (!pieUprightTextBox(FPDFPage_GetObject(page, i), box) || !pieSameLine(line, box)) continue;
+        if (box.r > x + 0.5f || x - box.r > maxGap) continue;
+        if (!found || box.r > outRight) outRight = box.r;
+        found = true;
+    }
+    return found;
+}
+
 void pieShiftRun(const std::vector<std::pair<FPDF_PAGEOBJECT, PieBox>>& run, float dx) {
     if (std::fabs(dx) < 0.01f) return;
     for (const auto& c : run) FPDFPageObj_Transform(c.first, 1, 0, 0, 1, dx, 0);
@@ -1965,7 +1981,17 @@ std::string applyBatchEditsJson(const std::string& inputPath, const std::string&
                 for (auto span = spans.rbegin(); span != spans.rend(); ++span) {
                     auto run = pieFollowingRun(page, line.first, span->r, {});
                     if (run.empty()) continue;
-                    pieShiftRun(run, span->l - run.front().second.l);
+                    // The gaps on both sides of the span collapse into one; the larger is kept,
+                    // so removing the start or end of a letter-spaced word (or the pieces after a
+                    // replaced part) keeps the word gap instead of the letter gap.
+                    float target = span->l;
+                    float prevRight = 0;
+                    if (pieLeftNeighbourRight(page, line.first, span->l, prevRight)) {
+                        const float gapBefore = std::max(0.0f, span->l - prevRight);
+                        const float gapAfter = std::max(0.0f, run.front().second.l - span->r);
+                        target = prevRight + std::max(gapBefore, gapAfter);
+                    }
+                    pieShiftRun(run, target - run.front().second.l);
                 }
             }
         }

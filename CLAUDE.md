@@ -969,6 +969,14 @@ Status: IMPLEMENTED + AUTOMATED TESTED (TypeScript PASS, Jest 58/58 suites, 1023
 - Character selection: native `getPageChars` (Android + iOS) -> `src/features/pdf/pdfCharSelection.ts` (lines, word at point, ranges, bands, handles, markup, `planRangeEdit`). PdfViewport: single tap only clears; long press selects a word; dragging a handle extends by character. Select Line / Select Word removed. Edit menu: Edit, Copy, Select All, Move (whole objects only), Highlight/Underline/Strikethrough, Delete. `PdfDocumentEditor.applyTextRangeEdit` = one native batch, one undo step. Partial-word edits change text only (format locked, explained in the panel); partial edits of objects whose characters do not match their text (ligatures) are refused. Falls back to object selection when no character data.
 - Haptics: Android `PieAppModule.haptic` now uses the Vibrator (`VibrationEffect.createPredefined`, touch attributes) + VIBRATE permission; `performHapticFeedback` is only the fallback.
 
+# Release QA Fixes (device QA, 2026-10-06)
+
+Status: IMPLEMENTED + AUTOMATED TESTED (TypeScript PASS, Jest 58/58 suites, 1026 tests) + BUILT (release) + INSTALLED and checked on device d22f6e82.
+
+- PDF reflow (pdfium_bridge.cpp): closing a deleted span keeps the larger of the two surrounding gaps (`pieLeftNeighbourRight`). Fixes "customeri nformation" when a letter-spaced word (one object per glyph group) is replaced. Verified on device with pie_cli (word gap kept: 7.7 pt).
+- OCR font size (src/features/ocr/normalization.ts `estimateFontSizeFromLine`): size from the line box using the glyph extent the text has (caps/digits/ascenders 0.72 em or x-height 0.52, descenders +0.27, 0.01 em padding; calibrated on device with ML Kit). Was 0.75 x box height, which drew replacements ~23% too small.
+- Background reconstruction grain (step 4c in textInpainting.ts / TextInpainting.kt / PieTextInpainting.h): filled pixels get the fine-detail residual (pixel minus 5x5 mean) of a real background pixel picked by an integer position hash, clamped to +-T/2; only masked pixels change. Parity script: Kotlin and C byte-identical; golden hash 345a282e... Device: grain std in deleted strokes 6.35 vs 6.46 in real background.
+
 # Current Next Phase
 
 

@@ -9,6 +9,9 @@
 //     r = clamp(round(0.06 * box height), 1, 4);
 //  4. only masked pixels are filled, outside-in (8-connected distance layers), from the
 //     inverse-squared-distance weighted average of known pixels in a 9x9 window;
+//  4c. grain: each filled pixel gets the fine-detail residual (pixel minus its 5x5 mean, RGB
+//     together) of a real background pixel picked by an integer hash of its position, clamped
+//     to +-T/2 (sources: 5x5 window without masked pixels, within T of the plane; >= 16);
 //  5. fallback to the plane fill (2 px feathered edge) when < 0.2% or > 60% of the target is
 //     flagged.
 // All coordinates are region-local (region = target + border ring). RGBA 8-bit buffers.
@@ -23,6 +26,8 @@
 #define PIE_INPAINT_WINDOW_RADIUS 4
 #define PIE_INPAINT_MIN_MASK_FRACTION 0.002
 #define PIE_INPAINT_MAX_MASK_FRACTION 0.6
+#define PIE_INPAINT_GRAIN_RADIUS 2
+#define PIE_INPAINT_GRAIN_MIN_SOURCES 16
 
 typedef struct {
   int method;          // 1 = inpaint, 0 = plane fill (fallback)
@@ -41,6 +46,15 @@ static inline double pie_inp_clamp255(double v) { return v < 0.0 ? 0.0 : (v > 25
 static inline int pie_inp_round(double v) { return (int)__builtin_floor(v + 0.5); }
 static inline double pie_inp_plane_at(const PieInpaintPlane *p, int x, int y) {
   return pie_inp_clamp255(p->c0 + p->a * x + p->b * y);
+}
+
+/** Deterministic 32-bit position hash (identical to grainHash in textInpainting.ts). */
+static inline uint32_t pie_inp_grain_hash(int x, int y) {
+  uint32_t h = ((uint32_t)x * 73856093u) ^ ((uint32_t)y * 19349663u);
+  h ^= h >> 13;
+  h *= 0x5bd1e995u;
+  h ^= h >> 15;
+  return h;
 }
 
 static inline PieInpaintPlane pie_inp_fit_plane(const double *xs, const double *ys, const double *cs, size_t n) {
@@ -74,9 +88,9 @@ static inline double pie_inp_dist(const uint8_t *px, int w, const PieInpaintPlan
 /** Bytes of scratch memory PieReconstructTextPatch needs for a w x h region. */
 static inline size_t PieInpaintScratchSize(int w, int h) {
   size_t cap = (size_t)w * (size_t)h;
-  // work(3) + border ring xs, ys, rs, gs, bs doubles (ring <= cap; sized for the worst case so
-  // the caller does not need the target) | layer, queue int32 | strong, mask bytes
-  return cap * 3 * sizeof(double) + cap * 5 * sizeof(double) + cap * 2 * sizeof(int32_t) + cap * 2 + 64;
+  // work(3) + grain residuals(3) + border ring xs, ys, rs, gs, bs doubles (ring <= cap; sized for
+  // the worst case so the caller does not need the target) | layer, queue int32 | strong, mask bytes
+  return cap * 6 * sizeof(double) + cap * 5 * sizeof(double) + cap * 2 * sizeof(int32_t) + cap * 2 + 64;
 }
 
 /** Scratch bytes when the target rectangle (clamped to the region) is known: smaller ring. */
@@ -84,7 +98,7 @@ static inline size_t PieInpaintScratchSizeForTarget(int w, int h, int tW, int tH
   size_t cap = (size_t)w * (size_t)h;
   size_t inner = (size_t)(tW > 0 ? tW : 0) * (size_t)(tH > 0 ? tH : 0);
   size_t ring = cap > inner ? cap - inner : 0;
-  return cap * 3 * sizeof(double) + ring * 5 * sizeof(double) + cap * 2 * sizeof(int32_t) + cap * 2 + 64;
+  return cap * 6 * sizeof(double) + ring * 5 * sizeof(double) + cap * 2 * sizeof(int32_t) + cap * 2 + 64;
 }
 
 /**
@@ -104,7 +118,8 @@ static inline int PieReconstructTextPatch(const uint8_t *px, int w, int h,
   const size_t inner = (size_t)(tx1 > tx0 ? tx1 - tx0 : 0) * (size_t)(ty1 > ty0 ? ty1 - ty0 : 0);
   const size_t ring = cap > inner ? cap - inner : 0;
   double *work = (double *)scratch;
-  double *xs = work + cap * 3;
+  double *residual = work + cap * 3;
+  double *xs = residual + cap * 3;
   double *ys = xs + ring, *rs = ys + ring, *gs = rs + ring, *bs = gs + ring;
   int32_t *layer = (int32_t *)(bs + ring);
   int32_t *queue = layer + cap;
@@ -268,6 +283,42 @@ static inline int PieReconstructTextPatch(const uint8_t *px, int w, int h,
       work[k * 3] = pie_inp_plane_at(&pr, x, y);
       work[k * 3 + 1] = pie_inp_plane_at(&pg, x, y);
       work[k * 3 + 2] = pie_inp_plane_at(&pb, x, y);
+    }
+  }
+
+  // 4c. Grain from the real background
+  const int G = PIE_INPAINT_GRAIN_RADIUS;
+  const double nn = (double)((2 * G + 1) * (2 * G + 1));
+  size_t sources = 0;
+  for (int y = G; y < h - G; y++) {
+    for (int x = G; x < w - G; x++) {
+      if (pie_inp_dist(px, w, &pr, &pg, &pb, x, y) > threshold) continue;
+      int ok = 1, s0 = 0, s1 = 0, s2 = 0;
+      for (int dy = -G; dy <= G && ok; dy++) {
+        for (int dx = -G; dx <= G; dx++) {
+          size_t kk = (size_t)(y + dy) * w + (x + dx);
+          if (mask[kk]) { ok = 0; break; }
+          s0 += px[kk * 4]; s1 += px[kk * 4 + 1]; s2 += px[kk * 4 + 2];
+        }
+      }
+      if (!ok) continue;
+      size_t k = (size_t)y * w + x;
+      residual[sources * 3] = px[k * 4] - s0 / nn;
+      residual[sources * 3 + 1] = px[k * 4 + 1] - s1 / nn;
+      residual[sources * 3 + 2] = px[k * 4 + 2] - s2 / nn;
+      sources++;
+    }
+  }
+  if (sources >= PIE_INPAINT_GRAIN_MIN_SOURCES) {
+    const double lim = threshold / 2;
+    for (size_t q = 0; q < tail; q++) {
+      size_t k = (size_t)queue[q];
+      int x = (int)(k % (size_t)w), y = (int)(k / (size_t)w);
+      size_t s = (size_t)(pie_inp_grain_hash(x, y) % (uint32_t)sources);
+      for (int c = 0; c < 3; c++) {
+        double e = residual[s * 3 + c];
+        work[k * 3 + c] += e < -lim ? -lim : (e > lim ? lim : e);
+      }
     }
   }
 

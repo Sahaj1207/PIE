@@ -87,7 +87,6 @@ describe('texture-preserving reconstruction', () => {
   it('textured background: the texture around and between letters is kept exactly', () => {
     // Vertical stripes (paper / fabric texture), dark text on top
     const stripe = (x: number): Rgb => (Math.floor(x / 2) % 2 === 0 ? [200, 180, 150] : [230, 210, 180]);
-    const clean = image(72, 40, (x) => stripe(x));
     const img = image(72, 40, (x) => stripe(x));
     drawText(img, [10, 10, 10]);
 
@@ -98,27 +97,61 @@ describe('texture-preserving reconstruction', () => {
 
     let unchanged = 0;
     let total = 0;
-    let maxError = 0;
     for (let y = TARGET.y; y < TARGET.y + TARGET.height; y++) {
       for (let x = TARGET.x; x < TARGET.x + TARGET.width; x++) {
         total++;
         const out = patchPx(res, x, y);
         const orig = px(img, x, y);
         if (out[0] === orig[0] && out[1] === orig[1] && out[2] === orig[2]) unchanged++;
-        const truth = px(clean, x, y);
-        maxError = Math.max(maxError, ...out.map((c, i) => Math.abs(c - truth[i])));
+        // Reconstructed strokes stay within the texture's range, widened by the texture's own
+        // fine detail (grain residuals here are at most +-18): no dark remnants, no hot spots
+        const lo: Rgb = [200 - 18, 180 - 18, 150 - 18];
+        const hi: Rgb = [230 + 18, 210 + 18, 180 + 18];
+        out.forEach((c, i) => {
+          expect(c).toBeGreaterThanOrEqual(lo[i]);
+          expect(c).toBeLessThanOrEqual(hi[i]);
+        });
       }
     }
     // Most of the box keeps the real texture (the old plane fill repainted 100%)
     expect(unchanged / total).toBeGreaterThan(0.6);
-    // Reconstructed strokes land within the texture's own range (no dark remnants)
-    expect(maxError).toBeLessThanOrEqual(31);
-    // No pixel of the text remains
+    // No pixel of the text (R = 10) remains
     for (let y = TARGET.y; y < TARGET.y + TARGET.height; y++) {
       for (let x = TARGET.x; x < TARGET.x + TARGET.width; x++) {
-        expect(patchPx(res, x, y)[0]).toBeGreaterThanOrEqual(190);
+        expect(patchPx(res, x, y)[0]).toBeGreaterThanOrEqual(182);
       }
     }
+  });
+
+  it('grainy background: filled strokes get grain from the real background (deterministic)', () => {
+    // Per-pixel grain of +-12 around a warm paper colour, dark text on top
+    const grain = (x: number, y: number) => ((x * 37 + y * 91 + ((x * y) % 7) * 13) % 25) - 12;
+    const bg = (x: number, y: number): Rgb => [200 + grain(x, y), 190 + grain(x, y), 170 + grain(x, y)];
+    const img = image(72, 40, bg);
+    drawText(img, [15, 15, 15]);
+    const res = reconstructTextPatch(img, TARGET, BOX);
+    expect(res.method).toBe('inpaint');
+
+    const std = (v: number[]) => {
+      const m = v.reduce((a, b) => a + b, 0) / v.length;
+      return Math.sqrt(v.reduce((a, b) => a + (b - m) * (b - m), 0) / v.length);
+    };
+    const filled: number[] = [];
+    const real: number[] = [];
+    for (let y = TARGET.y; y < TARGET.y + TARGET.height; y++) {
+      for (let x = TARGET.x; x < TARGET.x + TARGET.width; x++) {
+        const isStroke = px(img, x, y)[0] === 15;
+        if (isStroke) filled.push(patchPx(res, x, y)[0]);
+        else real.push(px(img, x, y)[0]);
+      }
+    }
+    // The filled strokes are as grainy as the real background (an average alone is ~3x smoother)
+    expect(std(filled) / std(real)).toBeGreaterThan(0.6);
+    expect(std(filled) / std(real)).toBeLessThan(1.4);
+    // ...with no dark remnants
+    expect(Math.min(...filled)).toBeGreaterThanOrEqual(170);
+    // Deterministic
+    expect(Buffer.from(reconstructTextPatch(img, TARGET, BOX).patch).equals(Buffer.from(res.patch))).toBe(true);
   });
 
   it('gradient background is continued smoothly through the strokes', () => {
@@ -229,7 +262,7 @@ describe('golden output (parity with the Kotlin and C ports)', () => {
       require('fs').writeFileSync(process.env.PARITY_OUT, out);
     }
     expect(crypto.createHash('sha256').update(out).digest('hex')).toBe(
-      '72a62ced5106abba52eb575a690fc5088d6d5bb2f77588dd8afd573eb7796cd9',
+      '345a282e3854e72826213d38de036995419ddc949f8de407445ea0b5bbd23cf9',
     );
   });
 });
