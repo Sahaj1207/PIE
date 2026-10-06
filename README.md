@@ -1,97 +1,120 @@
-This is a new [**React Native**](https://reactnative.dev) project, bootstrapped using [`@react-native-community/cli`](https://github.com/react-native-community/cli).
+# PIE — PDF & Image Editor
 
-# Getting Started
+PIE is an offline PDF and image editor for Android and iOS, built with React Native. It edits the
+existing text in PDFs and in screenshots or photos, matches the original font and layout as
+closely as possible, and does all processing on the device. Nothing is uploaded, there is no
+account, and there is no cloud OCR or AI image generation.
 
-> **Note**: Make sure you have completed the [Set Up Your Environment](https://reactnative.dev/docs/set-up-your-environment) guide before proceeding.
+## Features
 
-## Step 1: Start Metro
+### PDF
+- Open, render, zoom (with sharp re-rendering of the visible area) and pan, including rotated pages
+- **Select existing text like Google Drive:** long-press a word, then drag the handles to extend
+  the selection character by character
+- **Edit, replace and delete existing text**, including text inside nested Form XObjects; the
+  rest of the line closes up or makes room
+- Add text as movable, resizable text boxes (font, size, bold/italic, colour, alignment)
+- Highlight, underline and strikethrough in a choice of colours; ink and shapes; signatures; images
+- Pages: rotate, reorder, duplicate, insert blank, delete; merge PDFs; create a PDF from photos
+- Find text, copy page text
+- Undo/redo, Save, Save a Copy (system file picker), Share
+- Every edit is verified by reopening the saved file; a failed edit is reported, never hidden
+- The original file is never modified
 
-First, you will need to run **Metro**, the JavaScript build tool for React Native.
+### Images
+- Import JPEG/PNG (camera, photo library, files) at original resolution, with EXIF orientation
+- **On-device OCR**: Google ML Kit (Android), Apple Vision (iOS)
+- **Replace or delete detected text**: the original text is removed and the background behind it
+  is rebuilt deterministically (texture- and grain-preserving reconstruction; no AI)
+- Font size estimated from the detected text; add new text; markup and signatures; crop, rotate, flip
+- Undo/redo, saved edits, export to Photos (PNG/JPEG) at full resolution, Share
 
-To start the Metro dev server, run the following command from the root of your React Native project:
+### App
+- Library with search, filters, sort, grid/list views, rename, duplicate, share, delete
+- Light/dark mode, iOS-style interface, haptics
+- Works fully offline; the Android release build has no INTERNET permission
 
-```sh
-# Using npm
-npm start
+## Technology
 
-# OR using Yarn
-yarn start
+| Area | Stack |
+| --- | --- |
+| App | React Native 0.87 (New Architecture, Hermes), React 19, TypeScript (strict) |
+| UI | React Navigation 7, Reanimated, Gesture Handler, Skia |
+| PDF engine | PDFium with a platform-neutral C++ bridge shared by Android (JNI) and iOS |
+| OCR | Google ML Kit text recognition (Android), Apple Vision (iOS), on-device |
+| Native | Kotlin + C++ (Android), Objective-C / C (iOS, `PieNative` pod) |
+
+## Project layout
+
+```
+src/
+  features/pdf        PDF editor model, selection, verification, rendering cache
+  features/image      Image editing, render plan, background reconstruction
+  features/ocr        OCR normalization and font size estimation
+  screens/            Library, PDF editor, image editor, settings
+  ui/                 Shared iOS-style controls, theme, overlays
+android/app/src/main/cpp/pdfium   PDFium C++ engine (shared with iOS)
+android/app/src/main/java/...     Kotlin native modules (PDF, image, OCR, storage)
+ios/PieNative                     iOS native modules and C ports
+__tests__/                        Jest suites (1,026 tests)
+scripts/                          iOS PDFium fetch script, reconstruction parity check
 ```
 
-## Step 2: Build and run your app
+## Building
 
-With Metro running, open a new terminal window/pane from the root of your React Native project, and use one of the following commands to build and run your Android or iOS app:
+Requirements: Node.js 22.11+, JDK 17 (Android Studio's JBR works), Android SDK with NDK
+27.1.12297006. iOS builds need a Mac with Xcode and CocoaPods.
+
+```sh
+npm install
+npm run typecheck
+npm test
+```
 
 ### Android
 
 ```sh
-# Using npm
-npm run android
-
-# OR using Yarn
-yarn android
+cd android
+./gradlew assembleRelease     # APK: android/app/build/outputs/apk/release/app-release.apk
+./gradlew bundleRelease       # AAB: android/app/build/outputs/bundle/release/app-release.aab
 ```
+
+Release signing reads `android/keystore.properties` and the upload keystore, which are not
+committed. Without them, use `./gradlew assembleDebug` for a debug build, or `npm run android`
+with Metro running (`npm start`).
 
 ### iOS
 
-For iOS, remember to install CocoaPods dependencies (this only needs to be run on first clone or after updating native deps).
-
-The first time you create a new project, run the Ruby bundler to install CocoaPods itself:
-
 ```sh
-bundle install
-```
-
-Then, and every time you update your native dependencies, run:
-
-```sh
-bundle exec pod install
-```
-
-For more information, please visit [CocoaPods Getting Started guide](https://guides.cocoapods.org/using/getting-started.html).
-
-```sh
-# Using npm
+./scripts/fetch-pdfium-ios.sh   # downloads the PDFium xcframework into ios/PieNative/Vendor
+cd ios && pod install && cd ..
 npm run ios
-
-# OR using Yarn
-yarn ios
 ```
 
-If everything is set up correctly, you should see your new app running in the Android Emulator, iOS Simulator, or your connected device.
+The iOS native layer is implemented but has not yet been built or tested on a Mac.
 
-This is one way to run your app — you can also build it directly from Android Studio or Xcode.
+## Testing
 
-## Step 3: Modify your app
+- `npm test`: 58 Jest suites, 1,026 tests (editing models, PDF verification, OCR, reconstruction,
+  persistence, UI behaviour)
+- `npm run typecheck`: TypeScript strict
+- `scripts/inpainting-parity/run-parity.sh`: checks that the Kotlin and C reconstruction ports are
+  byte-identical to the TypeScript reference
 
-Now that you have successfully run the app, let's make changes!
+The Android release build has been installed and checked on a physical device (OnePlus,
+Android 16): PDF creation from photos, merge, add image, text selection/edit/delete,
+save/reopen, OCR, text replace/delete with reconstruction, export, and restart.
 
-Open `App.tsx` in your text editor of choice and make some changes. When you save, your app will automatically update and reflect these changes — this is powered by [Fast Refresh](https://reactnative.dev/docs/fast-refresh).
+## Known limitations
 
-When you want to forcefully reload, for example to reset the state of your app, you can perform a full reload:
+- Android OCR uses ML Kit's Latin recognizer.
+- Highlights, ink and shapes are written into the page content, not as editable PDF annotations.
+- Added PDF text uses the standard PDF fonts (WinAnsi characters).
+- In PDFs whose words are made of widely spaced letter groups, a long-press selects part of the
+  word; drag the handles to select the rest.
+- iOS: not yet built or tested.
 
-- **Android**: Press the <kbd>R</kbd> key twice or select **"Reload"** from the **Dev Menu**, accessed via <kbd>Ctrl</kbd> + <kbd>M</kbd> (Windows/Linux) or <kbd>Cmd ⌘</kbd> + <kbd>M</kbd> (macOS).
-- **iOS**: Press <kbd>R</kbd> in iOS Simulator.
+## Privacy
 
-## Congratulations! :tada:
-
-You've successfully run and modified your React Native App. :partying_face:
-
-### Now what?
-
-- If you want to add this new React Native code to an existing application, check out the [Integration guide](https://reactnative.dev/docs/integration-with-existing-apps).
-- If you're curious to learn more about React Native, check out the [docs](https://reactnative.dev/docs/getting-started).
-
-# Troubleshooting
-
-If you're having issues getting the above steps to work, see the [Troubleshooting](https://reactnative.dev/docs/troubleshooting) page.
-
-# Learn More
-
-To learn more about React Native, take a look at the following resources:
-
-- [React Native Website](https://reactnative.dev) - learn more about React Native.
-- [Getting Started](https://reactnative.dev/docs/environment-setup) - an **overview** of React Native and how setup your environment.
-- [Learn the Basics](https://reactnative.dev/docs/getting-started) - a **guided tour** of the React Native **basics**.
-- [Blog](https://reactnative.dev/blog) - read the latest official React Native **Blog** posts.
-- [`@facebook/react-native`](https://github.com/facebook/react-native) - the Open Source; GitHub **repository** for React Native.
+All documents stay in the app's private storage on the device. PIE has no account, no analytics,
+no cloud storage and no network access in the Android release build.
