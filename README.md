@@ -91,8 +91,6 @@ cd ios && pod install && cd ..
 npm run ios
 ```
 
-The iOS native layer is implemented but has not yet been built or tested on a Mac.
-
 ## Testing
 
 - `npm test`: 58 Jest suites, 1,026 tests (editing models, PDF verification, OCR, reconstruction,
@@ -104,15 +102,6 @@ The iOS native layer is implemented but has not yet been built or tested on a Ma
 The Android release build has been installed and checked on a physical device (OnePlus,
 Android 16): PDF creation from photos, merge, add image, text selection/edit/delete,
 save/reopen, OCR, text replace/delete with reconstruction, export, and restart.
-
-## Known limitations
-
-- Android OCR uses ML Kit's Latin recognizer.
-- Highlights, ink and shapes are written into the page content, not as editable PDF annotations.
-- Added PDF text uses the standard PDF fonts (WinAnsi characters).
-- In PDFs whose words are made of widely spaced letter groups, a long-press selects part of the
-  word; drag the handles to select the rest.
-- iOS: not yet built or tested.
 
 ## Privacy
 
