@@ -1,0 +1,85 @@
+# Builds PIE for iPhone on a GitHub-hosted Mac and publishes an UNSIGNED .ipa as an artifact.
+# Install it on an iPhone from Windows with Sideloadly (signs it with a free Apple ID; the
+# app then runs for 7 days and can be re-installed). Compiler errors are surfaced as
+# workflow annotations.
+name: iOS build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'ios/**'
+      - 'PieNative.podspec'
+      - 'android/app/src/main/cpp/**'
+      - 'src/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/ios-build.yml'
+
+jobs:
+  ipa:
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install JS dependencies
+        run: npm ci
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+          bundler-cache: true
+
+      - name: Fetch PDFium for iOS
+        run: ./scripts/fetch-pdfium-ios.sh
+
+      - name: Install pods
+        working-directory: ios
+        run: bundle exec pod install
+
+      - name: Build for iPhone (unsigned, Release)
+        run: |
+          set +e
+          xcodebuild \
+            -workspace ios/PdfAndImageEditor.xcworkspace \
+            -scheme PdfAndImageEditor \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build > xcodebuild.log 2>&1
+          status=$?
+          grep -E 'error:|BUILD (SUCCEEDED|FAILED)' xcodebuild.log | head -200
+          exit $status
+
+      - name: Report compiler errors
+        if: failure()
+        run: |
+          # One annotation per distinct error (readable without signing in).
+          grep -E '(^|: )error: |fatal error:|ld: |Undefined symbol|\*\* BUILD FAILED' xcodebuild.log \
+            | sed -E 's#/Users/runner/work/PIE/PIE/##g' | awk '!seen[$0]++' | head -45 \
+            | while IFS= read -r line; do echo "::error::${line//%/%25}"; done || true
+          tail -60 xcodebuild.log | sed -E 's#/Users/runner/work/PIE/PIE/##g' | while IFS= read -r line; do echo "::warning::${line//%/%25}"; done | tail -5 || true
+
+      - name: Package .ipa
+        run: |
+          APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -1)
+          test -n "$APP"
+          mkdir Payload
+          cp -R "$APP" Payload/
+          zip -qry PIE-unsigned.ipa Payload
+          ls -la PIE-unsigned.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PIE-ios-unsigned-ipa
+          path: PIE-unsigned.ipa
+          retention-days: 30
