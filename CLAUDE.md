@@ -977,6 +977,17 @@ Status: IMPLEMENTED + AUTOMATED TESTED (TypeScript PASS, Jest 58/58 suites, 1026
 - OCR font size (src/features/ocr/normalization.ts `estimateFontSizeFromLine`): size from the line box using the glyph extent the text has (caps/digits/ascenders 0.72 em or x-height 0.52, descenders +0.27, 0.01 em padding; calibrated on device with ML Kit). Was 0.75 x box height, which drew replacements ~23% too small.
 - Background reconstruction grain (step 4c in textInpainting.ts / TextInpainting.kt / PieTextInpainting.h): filled pixels get the fine-detail residual (pixel minus 5x5 mean) of a real background pixel picked by an integer position hash, clamped to +-T/2; only masked pixels change. Parity script: Kotlin and C byte-identical; golden hash 345a282e... Device: grain std in deleted strokes 6.35 vs 6.46 in real background.
 
+# Version 1.1 — Text Recognition for Scanned PDFs
+
+Status: IMPLEMENTED + AUTOMATED TESTED (TypeScript PASS, Jest 59/59 suites, 1036 tests incl. new `__tests__/pdfScannedOcr.test.ts`; C++ NDK syntax check clean). versionCode 2 / versionName 1.1.0. Physical OCR quality on real scans NOT VERIFIED.
+
+- Scanned pages (no text layer, e.g. scanner output) are detected (`isLikelyScannedPage`) and a hint offers "Detect Text"; also in the PDF More menu ("Detect Text (Scanned Page)" / "Detect Text Again").
+- `src/features/pdf/pdfOcr.ts`: PDFium render at ~300 dpi (16 MP budget) -> existing OCR engine (ML Kit / Vision + preprocessing) -> regions in page display points. Tap selects a recognised line (PdfViewport `onTapPoint`, runs before PDF text selection); edit menu: Edit (replace), Copy, Copy Page, Delete. Copy Page Text and Find include recognised text (`searchOcrPages` merged into PdfSearchBar via `extraSearch`).
+- Replace / delete reuse the image editor's deterministic background reconstruction on the same render: patch -> JPEG -> `addImage`, plus new native `addText` op (pie_pdf_ops.h: standard-14 font, WinAnsi only, upright baseline) for replacements. One `applyDocumentOperations` batch = one undoable, verified revision.
+- Recognised regions are session state: cleared on undo/redo and page-structure operations (Detect Text again); an edited line is removed from the list.
+
+Limitations: ML Kit recognises Latin script only (Android); handwriting/skewed/blurry scans recognise poorly; replacement text uses Helvetica (standard fonts, WinAnsi characters), sized to the scanned line.
+
 # Current Next Phase
 
 

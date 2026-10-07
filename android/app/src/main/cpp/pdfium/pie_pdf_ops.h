@@ -486,6 +486,53 @@ inline bool applyMarkup(FPDF_DOCUMENT doc, FPDF_PAGE page, int pageIndex, const 
         FPDFImageObj_SetMatrix(image, x1 - x0, y1 - y0, x2 - x0, y2 - y0, x0, y0);
         FPDFPage_InsertObject(page, image);
         inserted = true;
+    } else if (type == "addText") {
+        // One upright line of standard-14 text whose baseline starts at display point (x, y).
+        // Used to write recognised (OCR) text back onto scanned pages.
+        const std::string text = jsonString(op.get("text"));
+        std::string font = jsonString(op.get("fontName"), "Helvetica");
+        static const char* kStandard[] = {"Helvetica", "Helvetica-Bold", "Helvetica-Oblique", "Helvetica-BoldOblique",
+                                          "Times-Roman", "Times-Bold", "Times-Italic", "Times-BoldItalic",
+                                          "Courier", "Courier-Bold", "Courier-Oblique", "Courier-BoldOblique"};
+        bool known = false;
+        for (const char* f : kStandard) known = known || font == f;
+        if (!known) font = "Helvetica";
+        const double size = std::clamp(jsonNumber(op.get("fontSize"), 12.0), 1.0, 400.0);
+        const double x = jsonNumber(op.get("x"), 0), y = jsonNumber(op.get("y"), 0);
+        if (text.empty()) {
+            error = "Text is empty";
+            return false;
+        }
+        for (uint32_t cp : pie::decodeCodePoints(text)) {
+            if (!pie::isWinAnsiEncodable(cp)) {
+                error = std::string(pie::kUnsupportedGlyphsPrefix) + "The standard font cannot display " +
+                        pie::describeCodePoints({cp}) + ".";
+                return false;
+            }
+        }
+        FPDF_PAGEOBJECT obj = FPDFPageObj_NewTextObj(doc, font.c_str(), static_cast<float>(size));
+        if (!obj) {
+            error = "Text object could not be created";
+            return false;
+        }
+        std::vector<FPDF_WCHAR> wide;
+        for (uint16_t u : pie::utf8ToUtf16(text)) wide.push_back(static_cast<FPDF_WCHAR>(u));
+        wide.push_back(0);
+        if (!FPDFText_SetText(obj, wide.data())) {
+            FPDFPageObj_Destroy(obj);
+            error = "Text could not be set";
+            return false;
+        }
+        const Rgba color = parseColor(op.get("color"), 1.0, Rgba{0, 0, 0, 255});
+        FPDFPageObj_SetFillColor(obj, color.r, color.g, color.b, color.a);
+        // Basis: x along the displayed page's +u, "up" along -v, origin at the baseline start.
+        float ox, oy, ax, ay, bx, by;
+        toUser.map(x, y, ox, oy);
+        toUser.map(x + 1, y, ax, ay);
+        toUser.map(x, y - 1, bx, by);
+        FPDFPageObj_Transform(obj, ax - ox, ay - oy, bx - ox, by - oy, ox, oy);
+        FPDFPage_InsertObject(page, obj);
+        inserted = true;
     } else {
         error = "Unknown markup operation";
         return false;
@@ -595,7 +642,8 @@ inline std::string applyDocumentOperationsJson(const std::string& inputPath, con
                 if (src) FPDF_CloseDocument(src);
                 if (!r.applied) r.error = "Page could not be duplicated";
             }
-        } else if (r.type == "addInk" || r.type == "addShape" || r.type == "addHighlight" || r.type == "addImage") {
+        } else if (r.type == "addInk" || r.type == "addShape" || r.type == "addHighlight" || r.type == "addImage" ||
+                   r.type == "addText") {
             if (r.pageIndex < 0 || r.pageIndex >= count) {
                 r.error = "Page index out of range";
             } else if (FPDF_PAGE page = FPDF_LoadPage(doc, r.pageIndex)) {

@@ -89,7 +89,7 @@ import { displayTitle } from '../features/library/libraryService';
 import { useTheme } from '../ui/ThemeProvider';
 import { Icon } from '../ui/Icon';
 import { BackButton, BarButton, EmptyState, NavBar, PillButton, Toolbar, ToolbarItem } from '../ui/controls';
-import { showActionSheet, showAlert, showToast } from '../ui/overlays';
+import { showActionSheet, showAlert, showPrompt, showToast } from '../ui/overlays';
 import { haptic } from '../ui/haptics';
 import { copyText } from '../ui/clipboard';
 import { EditMenu, EditMenuColorChooser, EditMenuItem, HintPill } from '../ui/EditMenu';
@@ -147,6 +147,18 @@ import {
 import { Bounds, Point, fitStrokesInto, rectCommands } from '../features/markup/inkPath';
 import { SavedSignature } from '../features/markup/signatureStore';
 import { pickImageFromLibrary } from '../features/image/importService';
+import {
+  PdfOcrRegion,
+  buildOcrEditOperations,
+  hitTestOcrRegions,
+  isLikelyScannedPage,
+  ocrPageText,
+  recognizePdfPage,
+  searchOcrPages,
+  unsupportedOcrReplacementChars,
+} from '../features/pdf/pdfOcr';
+import { operationKind } from '../features/pdf/pdfDocumentOperations';
+import { describeChars } from '../features/pdf/pdfGlyphCoverage';
 
 /**
  * Registers (or re-points) the library record of a freshly imported PDF at its durable
@@ -239,6 +251,20 @@ export const PdfEditorScreen: React.FC = () => {
   charRangeRef.current = charRange;
   const charMode = !!pageChars && pageChars.chars.length > 0;
 
+  // Scanned pages: text recognised on-device per page (display points) and the selected line.
+  const [ocrPages, setOcrPages] = useState<Record<number, PdfOcrRegion[]>>({});
+  const ocrPagesRef = useRef(ocrPages);
+  ocrPagesRef.current = ocrPages;
+  const [selectedOcr, setSelectedOcr] = useState<PdfOcrRegion | null>(null);
+  const selectedOcrRef = useRef<PdfOcrRegion | null>(null);
+  selectedOcrRef.current = selectedOcr;
+  const [ocrRunning, setOcrRunning] = useState(false);
+  const [scanHintDismissed, setScanHintDismissed] = useState(false);
+  // A recognised line belongs to its page
+  useEffect(() => {
+    setSelectedOcr(null);
+  }, [currentPageIndex]);
+
   /**
    * Tap on the page. With character selection a tap only clears the selection (long press
    * selects); without character data (fallback) a tap selects the text object under the finger.
@@ -246,6 +272,7 @@ export const PdfEditorScreen: React.FC = () => {
   const handleSelectObject = useCallback(
     (obj: PdfTextObject | null) => {
       setCharRange(null);
+      setSelectedOcr(null);
       if (!obj) {
         setSelectedObject(null);
         setPdfSelection(null);
@@ -1093,6 +1120,11 @@ export const PdfEditorScreen: React.FC = () => {
       try {
         const workingCopyPath = await nextWorkingCopyPath();
         await editor.applyDocumentOperations(ops, workingCopyPath);
+        if (ops.some((op) => operationKind(op) === 'pages')) {
+          // Page order / rotation changed: recognised positions no longer apply.
+          setOcrPages({});
+          setSelectedOcr(null);
+        }
         const count = editor.getPageCount();
         setPageCount(count);
         setCurrentPdfPath(workingCopyPath);
@@ -1442,6 +1474,9 @@ export const PdfEditorScreen: React.FC = () => {
       await loadPage(Math.min(currentPageIndex, count - 1), true);
       setSelectedObject(null);
       setPdfSelection(null);
+      // The page content changed under the recognised text: detect again when needed.
+      setOcrPages({});
+      setSelectedOcr(null);
       updateHistoryState(editor);
     },
     [currentPageIndex, loadPage, updateHistoryState],
@@ -1615,17 +1650,141 @@ export const PdfEditorScreen: React.FC = () => {
     }
   }, [isSaving, isExporting, getEditor, saveBeforeOutput, documentTitle]);
 
+  // -------------------------------------------------------------------------
+  // Scanned pages: on-device text recognition
+  // -------------------------------------------------------------------------
+
+  const handleDetectText = useCallback(async () => {
+    const identity = getEditor().getRenderIdentity();
+    const page = renderedPageRef.current;
+    if (!identity || !page || ocrRunning || operationBusy) return;
+    setOcrRunning(true);
+    setBusyLabel('Recognising text…');
+    handleSelectObject(null);
+    try {
+      const result = await recognizePdfPage(identity.docHandle, page.pageIndex, page.pageWidth, page.pageHeight);
+      setOcrPages((pages) => ({ ...pages, [page.pageIndex]: [...result.regions] }));
+      if (result.regions.length === 0) {
+        showAlert(
+          'No Text Found',
+          'No readable text was found on this page. Recognition works best on clear, straight scans of printed Latin-script text.',
+        );
+      } else {
+        showToast(`Found ${result.regions.length} ${result.regions.length === 1 ? 'line' : 'lines'} · tap text to select`, { icon: 'scanText' });
+      }
+    } catch (err: unknown) {
+      showAlert('Text Recognition Failed', err instanceof Error ? err.message : String(err));
+    } finally {
+      setOcrRunning(false);
+      setBusyLabel(null);
+    }
+  }, [getEditor, ocrRunning, operationBusy, handleSelectObject]);
+
+  /** Tap on a page with recognised text: select the line under the finger. */
+  const handleTapPoint = useCallback(
+    (point: { x: number; y: number }, tolerance: number): boolean => {
+      const regions = ocrPagesRef.current[currentPageIndex];
+      if (!regions || regions.length === 0) return false;
+      const hit = hitTestOcrRegions(regions, point, tolerance);
+      if (hit) {
+        haptic('selection');
+        handleSelectObject(null);
+        setSelectedOcr(hit);
+        return true;
+      }
+      if (selectedOcrRef.current) {
+        setSelectedOcr(null);
+        return true;
+      }
+      return false;
+    },
+    [currentPageIndex, handleSelectObject],
+  );
+
+  /** Removes (newText === null) or replaces a recognised line: one undoable revision. */
+  const applyOcrEdit = useCallback(
+    async (region: PdfOcrRegion, newText: string | null) => {
+      const identity = getEditor().getRenderIdentity();
+      const page = renderedPageRef.current;
+      if (!identity || !page) return;
+      let ops: PdfDocumentOperation[];
+      setBusyLabel(newText === null ? 'Removing text…' : 'Replacing text…');
+      try {
+        ops = await buildOcrEditOperations(identity.docHandle, region, page.pageWidth, page.pageHeight, newText);
+      } catch (err: unknown) {
+        setBusyLabel(null);
+        showAlert('Could Not Edit Text', err instanceof Error ? err.message : String(err));
+        return;
+      }
+      setBusyLabel(null);
+      const ok = await applyOperations(ops, newText === null ? 'Text removed' : 'Text replaced');
+      if (ok) {
+        setSelectedOcr(null);
+        setOcrPages((pages) => ({
+          ...pages,
+          [region.pageIndex]: (pages[region.pageIndex] ?? []).filter((r) => r.id !== region.id),
+        }));
+      }
+    },
+    [getEditor, applyOperations],
+  );
+
+  const handleEditOcr = useCallback(() => {
+    const region = selectedOcrRef.current;
+    if (!region) return;
+    showPrompt({
+      title: 'Edit Text',
+      message: 'The scanned text is covered with its rebuilt background and your text is written in its place.',
+      defaultValue: region.text,
+      confirmLabel: 'Replace',
+      validate: (value) => {
+        if (!value.trim()) return 'Enter the new text, or use Delete to remove it.';
+        const bad = unsupportedOcrReplacementChars(value);
+        return bad.length > 0 ? `These characters can't be written in a PDF standard font: ${describeChars(bad)}` : null;
+      },
+      onConfirm: (value) => {
+        if (value.trim() === region.text.trim()) return;
+        applyOcrEdit(region, value);
+      },
+    });
+  }, [applyOcrEdit]);
+
+  const handleDeleteOcr = useCallback(() => {
+    const region = selectedOcrRef.current;
+    if (!region) return;
+    if (!appSettings.get().confirmDestructive) {
+      applyOcrEdit(region, null);
+      return;
+    }
+    showAlert('Remove Text?', 'The scanned text is covered with its rebuilt background. You can undo this.', [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Remove', style: 'destructive', onPress: () => applyOcrEdit(region, null) },
+    ]);
+  }, [applyOcrEdit]);
+
+  const handleCopyOcr = useCallback(async (all: boolean) => {
+    const region = selectedOcrRef.current;
+    const text = all ? ocrPageText(ocrPagesRef.current[currentPageIndex] ?? []) : region?.text ?? '';
+    if (!text) return;
+    const ok = await copyText(text);
+    showToast(ok ? (all ? 'Page text copied' : 'Copied') : 'Copy is not available', { icon: ok ? 'check' : undefined });
+  }, [currentPageIndex]);
+
   const handleCopyPageText = useCallback(async () => {
     const identity = getEditor().getRenderIdentity();
     if (!identity) return;
-    const text = (await getPdfPageText(identity.docHandle, currentPageIndex)).trim();
+    let text = (await getPdfPageText(identity.docHandle, currentPageIndex)).trim();
+    if (!text) text = ocrPageText(ocrPagesRef.current[currentPageIndex] ?? []).trim();
     if (!text) {
-      showAlert('No Text on This Page', 'This page has no selectable text (it may be a scanned image).');
+      showAlert('No Text on This Page', 'This page looks like a scan, so its text is part of the picture. Detect Text recognises it on this device.', [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Detect Text', onPress: () => handleDetectText() },
+      ]);
       return;
     }
     const ok = await copyText(text);
     showToast(ok ? `Copied text of page ${currentPageIndex + 1}` : 'Copy is not available', { icon: ok ? 'check' : undefined });
-  }, [getEditor, currentPageIndex]);
+  }, [getEditor, currentPageIndex, handleDetectText]);
 
   // More menu
   const handleMoreMenu = useCallback(() => {
@@ -1638,11 +1797,16 @@ export const PdfEditorScreen: React.FC = () => {
         { label: 'Share…', icon: 'share', onPress: () => handleShare() },
         { label: 'Save a Copy…', icon: 'download', onPress: () => handleSaveAs() },
         { label: 'Add Image', icon: 'photo', onPress: () => handleAddImage() },
+        {
+          label: ocrPagesRef.current[currentPageIndex] ? 'Detect Text Again' : 'Detect Text (Scanned Page)',
+          icon: 'scanText',
+          onPress: () => handleDetectText(),
+        },
         { label: 'Copy Page Text', icon: 'docText', onPress: () => handleCopyPageText() },
         { label: 'Page Overview', icon: 'grid', onPress: () => setPagesVisible(true) },
       ],
     });
-  }, [isSaving, isExporting, getEditor, documentTitle, handleShare, handleSaveAs, handleAddImage, handleCopyPageText]);
+  }, [isSaving, isExporting, getEditor, documentTitle, handleShare, handleSaveAs, handleAddImage, handleCopyPageText, handleDetectText, currentPageIndex]);
 
   // -------------------------------------------------------------------------
   // Leaving the editor (unsaved changes)
@@ -1753,6 +1917,19 @@ export const PdfEditorScreen: React.FC = () => {
   const renderOverlay = useCallback(
     (ctx: PdfOverlayContext) => {
       const items: InkItem[] = [];
+      if (mode === 'view' || mode === 'search') {
+        (ocrPages[currentPageIndex] ?? []).forEach((r) => {
+          const selected = selectedOcr?.id === r.id;
+          items.push({
+            key: `ocr_${r.id}`,
+            commands: rectCommands({ x: r.rect.x - 1, y: r.rect.y - 1, width: r.rect.width + 2, height: r.rect.height + 2 }),
+            color: colors.selection,
+            width: 0,
+            opacity: selected ? 0.3 : 0.1,
+            fill: true,
+          });
+        });
+      }
       if (mode === 'search') {
         searchResults.forEach((r, i) => {
           if (r.pageIndex !== currentPageIndex) return;
@@ -1890,7 +2067,7 @@ export const PdfEditorScreen: React.FC = () => {
         </>
       );
     },
-    [mode, searchResults, searchIndex, currentPageIndex, drawings, livePoints, markupTool, markupWidth, markupColor, placement, textBox, colors.primary],
+    [mode, searchResults, searchIndex, currentPageIndex, drawings, livePoints, markupTool, markupWidth, markupColor, placement, textBox, colors.primary, colors.selection, ocrPages, selectedOcr],
   );
 
   // Start of the Add Text panel: the text box being placed, or the last used style
@@ -2007,6 +2184,7 @@ export const PdfEditorScreen: React.FC = () => {
         onClose={closeSearch}
         collapsed={!searchListVisible}
         onExpand={() => setSearchListVisible((v) => !v)}
+        extraSearch={(q) => searchOcrPages(ocrPagesRef.current, q)}
       />
     );
   } else if (mode === 'textBox') {
@@ -2144,6 +2322,7 @@ export const PdfEditorScreen: React.FC = () => {
               onPlacementGesture={mode === 'textBox' ? onTextBoxGesture : onPlacementGesture}
               onSwipePage={pageCount > 1 ? handleSwipePage : undefined}
               renderOverlay={renderOverlay}
+              onTapPoint={handleTapPoint}
             />
           )}
 
@@ -2153,7 +2332,7 @@ export const PdfEditorScreen: React.FC = () => {
           )}
 
           {/* Page indicator (tap for page overview) */}
-          {mode !== 'markup' && mode !== 'place' && pageCount > 1 && !selectedObject && (
+          {mode !== 'markup' && mode !== 'place' && pageCount > 1 && !selectedObject && !selectedOcr && (
             <Pressable
               onPress={() => setPagesVisible(true)}
               accessibilityRole="button"
@@ -2177,6 +2356,35 @@ export const PdfEditorScreen: React.FC = () => {
               text="Long-press text to select it, then drag the handles"
               actionLabel="OK"
               onAction={() => appSettings.update({ pdfSelectionTipSeen: true })}
+            />
+          )}
+
+          {/* Scanned page: offer on-device text recognition */}
+          {mode === 'view' && !loading && renderedPage && !hasSelection && !selectedOcr && !ocrPages[currentPageIndex] &&
+            !scanHintDismissed && isLikelyScannedPage(textObjects) && !busyLabel && (
+              <HintPill
+                icon="scanText"
+                text="Scanned page — its text is part of the picture"
+                actionLabel="Detect Text"
+                onAction={() => {
+                  setScanHintDismissed(true);
+                  handleDetectText();
+                }}
+              />
+            )}
+
+          {/* Edit menu for recognised (scanned) text */}
+          {selectedOcr && !editModalVisible && mode === 'view' && (
+            <EditMenu
+              items={[
+                { key: 'edit', label: 'Edit', icon: 'pencil', primary: true, onPress: handleEditOcr, accessibilityLabel: 'Replace recognised text' },
+                { key: 'copy', label: 'Copy', onPress: () => handleCopyOcr(false), accessibilityLabel: 'Copy recognised text' },
+                { key: 'copyAll', label: 'Copy Page', onPress: () => handleCopyOcr(true), accessibilityLabel: 'Copy all recognised text on this page' },
+                { key: 'delete', label: 'Delete', destructive: true, onPress: handleDeleteOcr, accessibilityLabel: 'Remove recognised text' },
+              ]}
+              preview={selectedOcr.text}
+              disabled={operationBusy}
+              onClose={() => setSelectedOcr(null)}
             />
           )}
 

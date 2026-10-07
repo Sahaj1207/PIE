@@ -65,7 +65,18 @@ export type PdfDocumentOperation =
       readonly color: string;
       readonly opacity?: number;
     }
-  | { readonly type: 'addImage'; readonly pageIndex: number; readonly imagePath: string; readonly rect: PdfRectLike };
+  | { readonly type: 'addImage'; readonly pageIndex: number; readonly imagePath: string; readonly rect: PdfRectLike }
+  | {
+      /** One upright line of standard-14 text; (x, y) = baseline start in display points. */
+      readonly type: 'addText';
+      readonly pageIndex: number;
+      readonly text: string;
+      readonly x: number;
+      readonly y: number;
+      readonly fontSize: number;
+      readonly fontName?: string;
+      readonly color?: string;
+    };
 
 export type PdfDocumentOperationKind = 'pages' | 'markup';
 

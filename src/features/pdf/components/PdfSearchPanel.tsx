@@ -8,6 +8,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useTheme } from '../../../ui/ThemeProvider';
 import { BarButton, SearchField } from '../../../ui/controls';
 import { PdfSearchResponse, PdfSearchResult, searchPdf } from '../pdfDocumentOperations';
+import { mergeSearchResults } from '../pdfOcr';
 import { fontWeights, spacing, typography } from '../../../constants/theme';
 
 export interface PdfSearchPanelProps {
@@ -20,6 +21,8 @@ export interface PdfSearchPanelProps {
   /** Collapsed: only the bar with result navigation (results drawn on the page). */
   readonly collapsed: boolean;
   readonly onExpand: () => void;
+  /** Additional matches (e.g. text recognised on scanned pages), merged with PDFium's. */
+  readonly extraSearch?: (query: string) => readonly PdfSearchResult[];
 }
 
 export const PdfSearchBar: React.FC<PdfSearchPanelProps> = ({
@@ -31,6 +34,7 @@ export const PdfSearchBar: React.FC<PdfSearchPanelProps> = ({
   onClose,
   collapsed,
   onExpand,
+  extraSearch,
 }) => {
   const { colors } = useTheme();
   const insets = useSafeAreaInsets();
@@ -53,8 +57,10 @@ export const PdfSearchBar: React.FC<PdfSearchPanelProps> = ({
       searchPdf(docHandle, q)
         .then((r) => {
           if (gen !== generation.current) return;
-          setResponse(r);
-          onResults(r.results);
+          const extra = extraSearch ? extraSearch(q) : [];
+          const merged: PdfSearchResponse = extra.length > 0 ? { results: mergeSearchResults(r.results, extra), truncated: r.truncated } : r;
+          setResponse(merged);
+          onResults(merged.results);
         })
         .catch(() => {
           if (gen === generation.current) {

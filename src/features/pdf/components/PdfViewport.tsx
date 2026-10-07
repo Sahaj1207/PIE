@@ -100,6 +100,11 @@ interface PdfViewportProps {
   /** Selection handle anchors in document points (caret x and line top/bottom). */
   selectionHandles?: PdfSelectionHandles | null;
   onHandleDrag?: (which: 'start' | 'end', point: { x: number; y: number }, phase: 'start' | 'move' | 'end') => void;
+  /**
+   * Called first for a tap on the page in select mode with the page point and the finger
+   * tolerance in points (e.g. recognised text on scanned pages). Return true when handled.
+   */
+  onTapPoint?: (point: { x: number; y: number }, tolerance: number) => boolean;
 }
 
 export interface PdfSelectionHandle {
@@ -153,6 +158,7 @@ export const PdfViewport: React.FC<PdfViewportProps> = ({
   onLongPressDoc,
   selectionHandles = null,
   onHandleDrag,
+  onTapPoint,
 }) => {
   const { colors, dark } = useTheme();
 
@@ -276,6 +282,11 @@ export const PdfViewport: React.FC<PdfViewportProps> = ({
         return;
       }
 
+      // Screen-provided targets (recognised text on scanned pages) come first
+      if (onTapPoint && onTapPoint(point, pdfTapToleranceDocPoints(baseScale, curScale))) {
+        return;
+      }
+
       // Character-level selection: a single tap never selects; it clears the selection
       if (onLongPressDoc) {
         onSelectObject(null);
@@ -306,6 +317,7 @@ export const PdfViewport: React.FC<PdfViewportProps> = ({
       textObjects,
       onSelectObject,
       onLongPressDoc,
+      onTapPoint,
     ],
   );
 
