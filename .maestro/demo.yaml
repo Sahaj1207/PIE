@@ -1,0 +1,20 @@
+appId: com.pdfimageeditor
+
+---
+- launchApp
+- takeScreenshot: 01-library
+
+- tapOn: "Edit Image"
+- tapOn: "Photo Library"
+
+- tapOn:
+    point: "20%,30%"
+
+- waitForAnimationToEnd
+- takeScreenshot: 02-photo-open
+
+- tapOn: "Detect Text"
+- waitForAnimationToEnd:
+    timeout: 15000
+
+- takeScreenshot: 03-text-detected
