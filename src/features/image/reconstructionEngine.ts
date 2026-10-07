@@ -52,7 +52,19 @@ function toVerifiedPatchResult(result: any): ReconstructedPatchResult {
     estimatedBackgroundColor: result.estimatedBackgroundColor,
     estimatedTextColor: result.estimatedTextColor,
     confidence: result.confidence ?? 0.9,
+    ...optionalInk(result),
   };
+}
+
+/** Optional ink measurements; dropped unless well-formed. */
+function optionalInk(result: any): Pick<ReconstructedPatchResult, 'inkBounds' | 'inkColor'> {
+  const out: { inkBounds?: DocumentRect; inkColor?: string } = {};
+  const i = result?.inkBounds;
+  if (i && [i.x, i.y, i.width, i.height].every((v) => Number.isFinite(Number(v))) && Number(i.width) > 0 && Number(i.height) > 0) {
+    out.inkBounds = { x: Number(i.x), y: Number(i.y), width: Number(i.width), height: Number(i.height) };
+  }
+  if (typeof result?.inkColor === 'string' && /^#[0-9a-fA-F]{6}$/.test(result.inkColor)) out.inkColor = result.inkColor;
+  return out;
 }
 
 export class LocalBackgroundReconstructionEngine

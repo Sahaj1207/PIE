@@ -1710,7 +1710,9 @@ export const PdfEditorScreen: React.FC = () => {
       let ops: PdfDocumentOperation[];
       setBusyLabel(newText === null ? 'Removing text…' : 'Replacing text…');
       try {
-        ops = await buildOcrEditOperations(identity.docHandle, region, page.pageWidth, page.pageHeight, newText);
+        ops = await buildOcrEditOperations(identity.docHandle, region, page.pageWidth, page.pageHeight, newText, {
+          neighbours: ocrPagesRef.current[region.pageIndex] ?? [],
+        });
       } catch (err: unknown) {
         setBusyLabel(null);
         showAlert('Could Not Edit Text', err instanceof Error ? err.message : String(err));
@@ -1737,6 +1739,7 @@ export const PdfEditorScreen: React.FC = () => {
       message: 'The scanned text is covered with its rebuilt background and your text is written in its place.',
       defaultValue: region.text,
       confirmLabel: 'Replace',
+      autoCapitalize: 'none',
       validate: (value) => {
         if (!value.trim()) return 'Enter the new text, or use Delete to remove it.';
         const bad = unsupportedOcrReplacementChars(value);

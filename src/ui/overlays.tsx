@@ -64,6 +64,8 @@ export interface PromptRequest {
   readonly onConfirm: (value: string) => void;
   /** Returns an error message to keep the prompt open, or null when the value is valid. */
   readonly validate?: (value: string) => string | null;
+  /** Keyboard capitalisation (default: sentences). Use 'none' to keep text exactly as typed. */
+  readonly autoCapitalize?: 'none' | 'sentences' | 'words' | 'characters';
 }
 
 export interface ToastRequest {
@@ -455,6 +457,8 @@ const PromptDialog: React.FC<{ request: PromptRequest; onClose: (then?: () => vo
               }}
               autoFocus
               selectTextOnFocus
+              autoCapitalize={request.autoCapitalize ?? 'sentences'}
+              autoCorrect={request.autoCapitalize === 'none' ? false : undefined}
               placeholder={request.placeholder}
               placeholderTextColor={colors.textMuted}
               onSubmitEditing={confirm}

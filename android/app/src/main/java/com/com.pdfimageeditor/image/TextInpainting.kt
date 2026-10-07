@@ -55,6 +55,10 @@ object TextInpainting {
         val textColor: String,
         val backgroundColor: String,
         val confidence: Double,
+        /** Ink bounding box inside the OCR box (x0, y0, x1, y1 exclusive, region coordinates), or null. */
+        val inkBounds: IntArray? = null,
+        /** Colour of the stroke cores (anti-aliased edges excluded), or null when no text was found. */
+        val inkColor: String? = null,
     )
 
     private class Plane(val c0: Double, val a: Double, val b: Double) {
@@ -149,17 +153,42 @@ object TextInpainting {
         val strong = BooleanArray(cap)
         var strongCount = 0
         var tr = 0.0; var tg = 0.0; var tb = 0.0; var tc = 0
+        var maxDist = 0.0
+        val colInk = IntArray(max(1, bW)); val rowInk = IntArray(max(1, bH))
         for (y in ty0 until ty1) {
             for (x in tx0 until tx1) {
-                if (distToPlane(x, y) > threshold) {
+                val d = distToPlane(x, y)
+                if (d > threshold) {
                     val k = y * w + x
                     strong[k] = true
                     strongCount++
                     if (x >= bX && x < bX + bW && y >= bY && y < bY + bH) {
                         tr += red(k); tg += green(k); tb += blue(k); tc++
+                        colInk[x - bX]++; rowInk[y - bY]++
+                        if (d > maxDist) maxDist = d
                     }
                 }
             }
+        }
+        // Ink extent: first/last columns and rows holding at least 2 text pixels (grain ignored)
+        val inkBounds: IntArray? = run {
+            val c0 = colInk.indexOfFirst { it >= 2 }; val c1 = colInk.indexOfLast { it >= 2 }
+            val r0 = rowInk.indexOfFirst { it >= 2 }; val r1 = rowInk.indexOfLast { it >= 2 }
+            if (c0 < 0 || r0 < 0) null else intArrayOf(bX + c0, bY + r0, bX + c1 + 1, bY + r1 + 1)
+        }
+        // Stroke cores: pixels well past the anti-aliased edge
+        val inkColor: String? = if (tc == 0) null else {
+            val cut = threshold + 0.6 * (maxDist - threshold)
+            var cr = 0.0; var cg = 0.0; var cb = 0.0; var cc = 0
+            for (y in max(ty0, bY) until min(ty1, bY + bH)) {
+                for (x in max(tx0, bX) until min(tx1, bX + bW)) {
+                    val k = y * w + x
+                    if (strong[k] && distToPlane(x, y) >= cut) {
+                        cr += red(k); cg += green(k); cb += blue(k); cc++
+                    }
+                }
+            }
+            if (cc > 0) hex(cr / cc, cg / cc, cb / cc) else hex(tr / tc, tg / tc, tb / tc)
         }
         val meanR = sumR / n; val meanG = sumG / n; val meanB = sumB / n
         val lum = 0.299 * meanR + 0.587 * meanG + 0.114 * meanB
@@ -186,7 +215,7 @@ object TextInpainting {
             }
             return Result(
                 patch, tw, th, "plane", area, threshold, sigma, textColor, backgroundColor,
-                max(0.3, min(0.75, 0.75 - sigma / 200))
+                max(0.3, min(0.75, 0.75 - sigma / 200)), inkBounds, inkColor
             )
         }
 
@@ -357,7 +386,7 @@ object TextInpainting {
         }
         return Result(
             patch, tw, th, "inpaint", filled, threshold, sigma, textColor, backgroundColor,
-            max(0.5, min(0.95, 0.95 - sigma / 150))
+            max(0.5, min(0.95, 0.95 - sigma / 150)), inkBounds, inkColor
         )
     }
 }

@@ -171,16 +171,79 @@ export function mergeSearchResults(
   return [...native, ...ocr].sort((a, b) => a.pageIndex - b.pageIndex || a.rects[0]?.y - b.rects[0]?.y || 0);
 }
 
+/** Recognised line boxes span ascender to descender: about 1.15 em of the font. */
+export const OCR_LINE_HEIGHT_EM = 1.15;
+/** Baseline position inside a recognised line box (fraction of its height from the top). */
+export const OCR_BASELINE_RATIO = 0.78;
+
 /**
- * Font size (points) for writing `text` into a recognised line box: about 80 % of the line
- * height, reduced when needed so the text fits the original width (+15 %).
+ * Measured ink of the scanned line: its horizontal extent (page points) and the text OCR read
+ * from it. When given, the printed size is taken from how wide that text was printed, which is
+ * far more precise than the line box height (OCR boxes are loose by a few pixels).
  */
-export function fitReplacementFontSize(text: string, rect: PdfOcrRect, fontName = 'Helvetica'): number {
-  const bySize = Math.max(4, rect.height * 0.8);
+export interface OcrInkReference {
+  readonly text: string;
+  readonly width: number;
+}
+
+/**
+ * Font size (points) for writing `text` into a recognised line box: the size the scanned line
+ * was printed at, reduced only when the new text would run well past the original width.
+ */
+export function fitReplacementFontSize(
+  text: string,
+  rect: PdfOcrRect,
+  fontName = 'Helvetica',
+  ink?: OcrInkReference,
+): number {
   const family = fontName.startsWith('Times') ? 'Times-Roman' : fontName.startsWith('Courier') ? 'Courier' : 'Helvetica';
-  const width = standardTextWidth(text, family, bySize, fontName.includes('Bold'));
-  if (width <= 0 || width <= rect.width * 1.15) return Math.round(bySize * 10) / 10;
-  return Math.max(4, Math.round(bySize * ((rect.width * 1.15) / width) * 10) / 10);
+  const bold = fontName.includes('Bold');
+  const byHeight = Math.max(4, rect.height / OCR_LINE_HEIGHT_EM);
+  let size = byHeight;
+  const unit = ink ? standardTextWidth(ink.text.trim(), family, 1, bold) : 0;
+  if (ink && unit > 0 && ink.width > 0) {
+    // Guard against misread text: stay within a sensible band around the height estimate.
+    size = Math.min(byHeight * 1.35, Math.max(byHeight * 0.8, ink.width / unit));
+  }
+  const width = standardTextWidth(text, family, size, bold);
+  const limit = Math.max(rect.width, ink?.width ?? 0) * 1.25;
+  if (width <= 0 || width <= limit) return Math.round(size * 10) / 10;
+  return Math.max(4, Math.round(size * (limit / width) * 10) / 10);
+}
+
+/**
+ * Area to rebuild behind a recognised line. OCR boxes hug the glyphs (and scans are often a
+ * little tilted), so edges and descenders would survive a box-sized patch. The box grows by
+ * half its height left/right and 35 % up/down, but never into a neighbouring recognised line
+ * and never past the page.
+ */
+export function ocrCoverRect(
+  region: PdfOcrRegion,
+  neighbours: readonly PdfOcrRegion[],
+  page: { width: number; height: number },
+): PdfOcrRect {
+  const r = region.rect;
+  let left = r.x - r.height * 0.5;
+  let right = r.x + r.width + r.height * 0.5;
+  let top = r.y - r.height * 0.35;
+  let bottom = r.y + r.height * 1.35;
+  for (const n of neighbours) {
+    if (n.id === region.id) continue;
+    const o = n.rect;
+    const overlapsX = o.x < right && o.x + o.width > left;
+    const overlapsY = o.y < bottom && o.y + o.height > top;
+    if (!overlapsX || !overlapsY) continue;
+    const gap = 0.5;
+    if (o.y + o.height <= r.y) top = Math.max(top, o.y + o.height + gap); // line above
+    else if (o.y >= r.y + r.height) bottom = Math.min(bottom, o.y - gap); // line below
+    else if (o.x + o.width <= r.x) left = Math.max(left, o.x + o.width + gap); // same line, left
+    else if (o.x >= r.x + r.width) right = Math.min(right, o.x - gap); // same line, right
+  }
+  left = Math.max(0, Math.min(left, r.x));
+  top = Math.max(0, Math.min(top, r.y));
+  right = Math.min(page.width, Math.max(right, r.x + r.width));
+  bottom = Math.min(page.height, Math.max(bottom, r.y + r.height));
+  return { x: left, y: top, width: right - left, height: bottom - top };
 }
 
 /** Characters the standard PDF fonts cannot write (the user must change them first). */
@@ -219,15 +282,17 @@ export async function buildOcrEditOperations(
   pageWidth: number,
   pageHeight: number,
   newText: string | null,
+  options: { readonly neighbours?: readonly PdfOcrRegion[] } = {},
 ): Promise<PdfDocumentOperation[]> {
   const scale = pdfOcrRenderScale(pageWidth, pageHeight);
   const render = await defaultPdfiumEngine.renderPage(docHandle, region.pageIndex, { scale });
   const k = render.width / Math.max(1e-6, pageWidth);
+  const cover = ocrCoverRect(region, options.neighbours ?? [], { width: pageWidth, height: pageHeight });
   const patch = await defaultReconstructionEngine.reconstructBackground(render.uri, {
-    x: region.rect.x * k,
-    y: region.rect.y * k,
-    width: region.rect.width * k,
-    height: region.rect.height * k,
+    x: cover.x * k,
+    y: cover.y * k,
+    width: cover.width * k,
+    height: cover.height * k,
   });
   const jpeg = await prepareImageForPdf(patch.patchUri);
   const ops: PdfDocumentOperation[] = [
@@ -245,17 +310,23 @@ export async function buildOcrEditOperations(
   ];
   const text = newText?.replace(/\s+/g, ' ').trim();
   if (text) {
-    const fontSize = fitReplacementFontSize(text, region.rect);
+    // Measured ink (inside the cover area) beats the OCR box for where and how big the line was.
+    const inkBox = patch.inkBounds;
+    const ink =
+      inkBox && inkBox.width > 0 && inkBox.x / k >= cover.x - 0.5 && (inkBox.x + inkBox.width) / k <= cover.x + cover.width + 0.5
+        ? { x: inkBox.x / k, width: inkBox.width / k }
+        : null;
+    const fontSize = fitReplacementFontSize(text, region.rect, 'Helvetica', ink ? { text: region.text, width: ink.width } : undefined);
+    const color = [patch.inkColor, patch.estimatedTextColor].find((c) => c && /^#[0-9a-fA-F]{6}$/.test(c));
     ops.push({
       type: 'addText',
       pageIndex: region.pageIndex,
       text,
-      x: region.rect.x,
-      // Baseline: line box minus the descender share (~20 %).
-      y: region.rect.y + region.rect.height * 0.8,
+      x: ink ? ink.x : region.rect.x,
+      y: region.rect.y + region.rect.height * OCR_BASELINE_RATIO,
       fontSize,
       fontName: 'Helvetica',
-      color: patch.estimatedTextColor && /^#[0-9a-fA-F]{6}$/.test(patch.estimatedTextColor) ? patch.estimatedTextColor : '#000000',
+      color: color ?? '#000000',
     });
   }
   return ops;

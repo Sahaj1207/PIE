@@ -100,6 +100,10 @@ export interface ReconstructedPatchResult {
   readonly estimatedBackgroundColor?: string;
   readonly estimatedTextColor?: string;
   readonly confidence?: number;
+  /** Bounding box of the detected text pixels inside the OCR box (image pixels), when found. */
+  readonly inkBounds?: DocumentRect;
+  /** Colour of the text stroke cores (anti-aliased edges excluded), when found. */
+  readonly inkColor?: string;
 }
 
 export interface IBackgroundReconstructionEngine {

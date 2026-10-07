@@ -564,6 +564,15 @@ class ImageProcessingModule(private val reactContext: ReactApplicationContext) :
 
                 result.putString("estimatedBackgroundColor", recon.backgroundColor)
                 result.putString("estimatedTextColor", recon.textColor)
+                recon.inkColor?.let { result.putString("inkColor", it) }
+                recon.inkBounds?.let { b ->
+                    val ink = Arguments.createMap()
+                    ink.putDouble("x", (b[0] + minX).toDouble())
+                    ink.putDouble("y", (b[1] + minY).toDouble())
+                    ink.putDouble("width", (b[2] - b[0]).toDouble())
+                    ink.putDouble("height", (b[3] - b[1]).toDouble())
+                    result.putMap("inkBounds", ink)
+                }
                 result.putDouble("confidence", recon.confidence)
                 result.putString("method", recon.method)
                 result.putInt("filledPixels", recon.filledPixels)
