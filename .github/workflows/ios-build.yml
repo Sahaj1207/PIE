@@ -58,6 +58,7 @@ jobs:
             build > xcodebuild.log 2>&1
           status=$?
           grep -E 'error:|BUILD (SUCCEEDED|FAILED)' xcodebuild.log | head -200
+          grep -A40 'Undefined symbols' xcodebuild.log | head -120 || true
           exit $status
 
       - name: Report compiler errors

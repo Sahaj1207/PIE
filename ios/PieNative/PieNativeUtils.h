@@ -4,6 +4,12 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
+// C linkage: these helpers are defined in PieNativeUtils.m and also called from
+// Objective-C++ (PdfiumNativeModule.mm).
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /** App-private durable root (Application Support/pie) — mirrors Android filesDir/pie. */
 NSString *PieDocumentsRoot(void);
 /** Cache sub-directory (created on demand) — mirrors Android cacheDir/<name>. */
@@ -32,6 +38,10 @@ CGImageRef _Nullable PieCreateUprightImage(NSString *uriOrPath, NSUInteger maxLo
 BOOL PieUprightImageSize(NSString *uriOrPath, NSInteger *width, NSInteger *height, NSInteger *_Nullable exifOrientation, NSString *_Nullable *_Nullable uti);
 /** Writes PNG (or JPEG when quality < 1 and opaque) data for a CGImage. */
 BOOL PieWriteImage(CGImageRef image, NSString *path, BOOL png, CGFloat quality);
+
+#ifdef __cplusplus
+}
+#endif
 
 /** Retains a UIDocumentPicker delegate while the picker is shown. */
 @interface PieDocumentPickerDelegate : NSObject <UIDocumentPickerDelegate, UIAdaptivePresentationControllerDelegate>
