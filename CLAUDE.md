@@ -989,6 +989,14 @@ Status: IMPLEMENTED + AUTOMATED TESTED (TypeScript PASS, Jest 59/59 suites, 1036
 
 Limitations: ML Kit recognises Latin script only (Android); handwriting/skewed/blurry scans recognise poorly; replacement text uses Helvetica (standard fonts, WinAnsi characters), sized to the scanned line.
 
+# iOS Build (GitHub Actions)
+
+Status: BUILT (unsigned Release .ipa on a GitHub-hosted Mac, run 37600683287, commit fc30d41). NOT installed or runtime verified on an iPhone yet (user tests via Sideloadly with a free Apple ID; apps expire after 7 days).
+
+- Workflow `.github/workflows/ios-build.yml` (manual or on push to main touching iOS/native/JS paths): npm ci -> scripts/fetch-pdfium-ios.sh -> pod install -> xcodebuild (iphoneos, Release, CODE_SIGNING_ALLOWED=NO) -> Payload zip `PIE-unsigned.ipa` artifact (30 days). Compiler/link errors are printed in the build step.
+- Fixes needed for the first build: fetch script executable bit; `PieNativeUtils.h` C helpers now `extern "C"` (they are called from PdfiumNativeModule.mm).
+- iOS marketing version is still 1.0 (Android 1.1.0).
+
 # Current Next Phase
 
 
