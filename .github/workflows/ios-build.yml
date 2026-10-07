@@ -38,7 +38,7 @@ jobs:
           bundler-cache: true
 
       - name: Fetch PDFium for iOS
-        run: ./scripts/fetch-pdfium-ios.sh
+        run: bash scripts/fetch-pdfium-ios.sh
 
       - name: Install pods
         working-directory: ios
